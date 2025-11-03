@@ -1,3 +1,5 @@
+## Consistency
+
 ## Elucidating the Design Space of Diffusion-Based Generative Models (EDM)<br><sub>Official PyTorch implementation of the NeurIPS 2022 paper</sub>
 
 ![Teaser image](./docs/teaser-1920x640.jpg)
