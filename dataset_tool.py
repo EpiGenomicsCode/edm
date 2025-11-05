@@ -99,6 +99,7 @@ def open_image_zip(source, *, max_images: Optional[int]):
         # Load labels from dataset.json if present.
         labels = dict()
         if 'dataset.json' in z.namelist():
+            print("Loading labels from dataset.json")
             with z.open('dataset.json', 'r') as file:
                 data = json.load(file)['labels']
                 if data is not None:
@@ -107,6 +108,7 @@ def open_image_zip(source, *, max_images: Optional[int]):
         # Fallback: infer labels from top-level directory names,
         # relative to the common root (prefer anything after '/train/').
         if len(labels) == 0 and len(input_images) > 0:
+            print("No labels found in dataset.json, inferring labels from top-level directory names.")
             def rel(name: str) -> str:
                 return name.split('/train/', 1)[1] if '/train/' in name else name
             relnames = {fn: rel(fn) for fn in input_images}
