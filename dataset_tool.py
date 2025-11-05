@@ -1,3 +1,8 @@
+#Imagenet dataset does not have a dataset.json file, so we need to create one. Current dataset_tool only creates one for an unzipped folder.
+#This script creates a dataset.json file in the root of the dataset folder. This helps because we dont need to extract the contents and worry about inode availability.
+
+
+
 # Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # This work is licensed under a Creative Commons
@@ -87,16 +92,29 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
 
 def open_image_zip(source, *, max_images: Optional[int]):
     with zipfile.ZipFile(source, mode='r') as z:
+        # Only keep images.
         input_images = [str(f) for f in sorted(z.namelist()) if is_image_ext(f)]
         max_idx = maybe_min(len(input_images), max_images)
 
-        # Load labels.
+        # Load labels from dataset.json if present.
         labels = dict()
         if 'dataset.json' in z.namelist():
             with z.open('dataset.json', 'r') as file:
                 data = json.load(file)['labels']
                 if data is not None:
                     labels = {x[0]: x[1] for x in data}
+
+        # Fallback: infer labels from top-level directory names,
+        # relative to the common root (prefer anything after '/train/').
+        if len(labels) == 0 and len(input_images) > 0:
+            def rel(name: str) -> str:
+                return name.split('/train/', 1)[1] if '/train/' in name else name
+            relnames = {fn: rel(fn) for fn in input_images}
+            toplevel = {fn: rn.split('/')[0] if '/' in rn else '' for fn, rn in relnames.items()}
+            classes = sorted(set(toplevel.values()))
+            if len(classes) > 1:
+                cls_to_idx = {c: i for i, c in enumerate(classes)}
+                labels = {fn: cls_to_idx[toplevel[fn]] for fn in input_images}
 
     def iterate_images():
         with zipfile.ZipFile(source, mode='r') as z:
@@ -107,6 +125,7 @@ def open_image_zip(source, *, max_images: Optional[int]):
                 if idx >= max_idx - 1:
                     break
     return max_idx, iterate_images()
+
 
 #----------------------------------------------------------------------------
 
