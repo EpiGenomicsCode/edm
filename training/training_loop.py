@@ -245,6 +245,10 @@ def training_loop(
                             log_dict['cd_T_edges'] = int(loss_fn._current_T_edges())
                     except Exception:
                         pass
+                    # Merge detailed training stats.
+                    stats_payload = training_stats.default_collector.as_dict()
+                    if isinstance(stats_payload, dict):
+                        log_dict.update(stats_payload)
                     import wandb as _wandb
                     _wandb.log(log_dict, commit=True)
                 except Exception as _e:
