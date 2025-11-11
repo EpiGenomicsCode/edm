@@ -91,6 +91,13 @@ def parse_int_list(s):
 @click.option('--transfer',      help='Transfer learning from network pickle', metavar='PKL|URL',   type=str)
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
+# Weights & Biases (optional).
+@click.option('--wandb',         help='Enable Weights & Biases logging', metavar='BOOL',            type=bool, default=False, show_default=True)
+@click.option('--wandb_project', help='W&B project name', metavar='STR',                            type=str, default='edm-consistency', show_default=True)
+@click.option('--wandb_entity',  help='W&B entity (team/user)', metavar='STR',                      type=str)
+@click.option('--wandb_run',     help='W&B run name', metavar='STR',                                type=str)
+@click.option('--wandb_tags',    help='W&B tags (comma-separated)', metavar='STR',                  type=str)
+@click.option('--wandb_mode',    help='W&B mode: online|offline|disabled', metavar='STR',           type=click.Choice(['online','offline','disabled']), default='online', show_default=True)
 
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
@@ -281,6 +288,46 @@ def main(**kwargs):
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
             json.dump(c, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
+
+    # Prepare W&B integration (optional).
+    if opts.wandb:
+        # Build a JSON-serializable copy of options to store as config.
+        try:
+            wandb_config = json.loads(json.dumps(c))
+        except Exception:
+            # As a fallback, store a minimal config.
+            wandb_config = dict(
+                dataset_kwargs=c.get('dataset_kwargs', {}),
+                network_kwargs=dict(
+                    class_name=c['network_kwargs'].get('class_name'),
+                    model_type=c['network_kwargs'].get('model_type'),
+                    model_channels=c['network_kwargs'].get('model_channels'),
+                    channel_mult=c['network_kwargs'].get('channel_mult'),
+                    use_fp16=c['network_kwargs'].get('use_fp16'),
+                ),
+                loss_kwargs=c.get('loss_kwargs', {}),
+                optimizer_kwargs=c.get('optimizer_kwargs', {}),
+                batch_size=c.get('batch_size'),
+                total_kimg=c.get('total_kimg'),
+                ema_halflife_kimg=c.get('ema_halflife_kimg'),
+                seed=c.get('seed'),
+            )
+        # Pass wandb args to training loop.
+        tags = None
+        if opts.wandb_tags:
+            tags = [t.strip() for t in opts.wandb_tags.split(',') if t.strip()]
+        c.wandb_kwargs = dict(
+            enabled=True,
+            project=opts.wandb_project,
+            entity=opts.wandb_entity,
+            name=opts.wandb_run,
+            tags=tags,
+            mode=opts.wandb_mode,
+        )
+        c.wandb_config = wandb_config
+    else:
+        c.wandb_kwargs = None
+        c.wandb_config = None
 
     # Train.
     training_loop.training_loop(**c)

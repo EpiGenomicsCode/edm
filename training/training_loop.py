@@ -30,6 +30,8 @@ def training_loop(
     loss_kwargs         = {},       # Options for loss function.
     optimizer_kwargs    = {},       # Options for optimizer.
     augment_kwargs      = None,     # Options for augmentation pipeline, None = disable.
+    wandb_kwargs        = None,     # Options for Weights & Biases logging, None = disable.
+    wandb_config        = None,     # Serializable run config to send to W&B (optional).
     seed                = 0,        # Global random seed.
     batch_size          = 512,      # Total batch size for one training iteration.
     batch_gpu           = None,     # Limit batch size per GPU, None = no limit.
@@ -89,6 +91,28 @@ def training_loop(
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
     ema = copy.deepcopy(net).eval().requires_grad_(False)
 
+    # Optional W&B initialization (async/threaded).
+    wandb_run = None
+    if wandb_kwargs is not None and wandb_kwargs.get('enabled', False) and dist.get_rank() == 0:
+        try:
+            import wandb as _wandb
+            # Prefer thread start method to avoid forking stalls.
+            if os.environ.get('WANDB_START_METHOD') is None:
+                os.environ['WANDB_START_METHOD'] = 'thread'
+            init_kwargs = dict(
+                project=wandb_kwargs.get('project', 'edm-consistency'),
+                entity=wandb_kwargs.get('entity', None),
+                name=wandb_kwargs.get('name', None),
+                tags=wandb_kwargs.get('tags', None),
+            )
+            mode = wandb_kwargs.get('mode', 'online')
+            if mode in ('offline', 'disabled'):
+                init_kwargs['mode'] = mode
+            wandb_run = _wandb.init(**init_kwargs, config=wandb_config)
+        except Exception as _e:
+            dist.print0(f'[W&B] init failed: {_e}')
+            wandb_run = None
+
     # Resume training from previous snapshot.
     if resume_pkl is not None:
         dist.print0(f'Loading network weights from "{resume_pkl}"...')
@@ -118,6 +142,8 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
+    ema_updates = 0
+    last_loss_scalar = None
     while True:
 
         # Accumulate gradients.
@@ -130,6 +156,10 @@ def training_loop(
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                try:
+                    last_loss_scalar = float(loss.mean().detach().cpu().item())
+                except Exception:
+                    pass
 
         # Update weights.
         for g in optimizer.param_groups:
@@ -146,6 +176,7 @@ def training_loop(
         ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
         for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+        ema_updates += 1
 
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
@@ -199,6 +230,25 @@ def training_loop(
                 stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
             stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
             stats_jsonl.flush()
+            # Optional W&B logging once per tick (async).
+            if wandb_run is not None:
+                try:
+                    log_dict = dict(
+                        progress_kimg=cur_nimg / 1e3,
+                        tick=cur_tick,
+                        loss=last_loss_scalar if last_loss_scalar is not None else None,
+                        ema_updates=ema_updates,
+                    )
+                    # Teacher grid T edges if exposed by CD loss.
+                    try:
+                        if hasattr(loss_fn, '_current_T_edges'):
+                            log_dict['cd_T_edges'] = int(loss_fn._current_T_edges())
+                    except Exception:
+                        pass
+                    import wandb as _wandb
+                    _wandb.log(log_dict, commit=True)
+                except Exception as _e:
+                    dist.print0(f'[W&B] log failed: {_e}')
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
@@ -212,5 +262,12 @@ def training_loop(
     # Done.
     dist.print0()
     dist.print0('Exiting...')
+    # Close W&B run.
+    try:
+        if wandb_run is not None and dist.get_rank() == 0:
+            import wandb as _wandb
+            _wandb.finish()
+    except Exception:
+        pass
 
 #----------------------------------------------------------------------------
