@@ -14,6 +14,7 @@ import json
 import click
 import torch
 import dnnlib
+import pickle
 from torch_utils import distributed as dist
 from training import training_loop
 
@@ -46,6 +47,20 @@ def parse_int_list(s):
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
+
+# Consistency Distillation (MCD) options.
+@click.option('--consistency',   help='Enable Multistep Consistency Distillation (MCD)', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--teacher',       help='Path/URL to pre-trained teacher (EDM-precond UNet)', metavar='PKL|URL', type=str)
+@click.option('--S',             help='Student step count', metavar='INT', type=click.IntRange(min=2), default=8, show_default=True)
+@click.option('--T_start',       help='Initial teacher edges', metavar='INT', type=click.IntRange(min=2), default=256, show_default=True)
+@click.option('--T_end',         help='Final teacher edges', metavar='INT', type=click.IntRange(min=2), default=1024, show_default=True)
+@click.option('--T_anneal_kimg', help='kimg horizon for linear anneal', metavar='INT', type=click.IntRange(min=0), default=750, show_default=True)
+@click.option('--rho',           help='Karras rho exponent', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=7.0, show_default=True)
+@click.option('--sigma_min',     help='Minimum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.002, show_default=True)
+@click.option('--sigma_max',     help='Maximum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=80.0, show_default=True)
+@click.option('--cd_loss',       help='Consistency loss type', metavar='huber|l2', type=click.Choice(['huber', 'l2']), default='huber', show_default=True)
+@click.option('--cd_weight_mode',help='Consistency weight mode', metavar='edm|vlike', type=click.Choice(['edm', 'vlike']), default='edm', show_default=True)
+@click.option('--snap_cd_eval',  help='Optional: ticks interval for tiny S-step sanity samples (0=off)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -135,6 +150,45 @@ def main(**kwargs):
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
 
+    # Consistency Distillation wiring (overrides loss when enabled).
+    if opts.consistency:
+        # Enforce EDM preconditioning for student.
+        if opts.precond != 'edm':
+            raise click.ClickException('--consistency=True requires --precond=edm')
+        # Validate teacher.
+        if not opts.teacher:
+            raise click.ClickException('--consistency=True requires --teacher=PKL|URL')
+        # Load teacher network and place on current device.
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        with dnnlib.util.open_url(opts.teacher, verbose=(dist.get_rank() == 0)) as f:
+            teacher_data = pickle.load(f)
+        if isinstance(teacher_data, dict) and ('ema' in teacher_data or 'net' in teacher_data):
+            teacher = teacher_data['ema'] if 'ema' in teacher_data else teacher_data['net']
+        else:
+            teacher = teacher_data
+        teacher = teacher.eval().requires_grad_(False).to(device)
+        # Update loss to CD.
+        c.loss_kwargs.class_name = 'training.loss_cd.EDMConsistencyDistillLoss'
+        c.loss_kwargs.update(
+            teacher_net=teacher,
+            S=opts.S,
+            T_start=opts.T_start,
+            T_end=opts.T_end,
+            T_anneal_kimg=opts.T_anneal_kimg,
+            rho=opts.rho,
+            sigma_min=opts.sigma_min,
+            sigma_max=opts.sigma_max,
+            loss_type=opts.cd_loss,
+            weight_mode=opts.cd_weight_mode,
+        )
+        # Provenance and optional eval knob (stored only).
+        c.teacher = opts.teacher
+        c.snap_cd_eval = opts.snap_cd_eval
+        # If user did not specify transfer/resume, seed student from teacher EMA by default.
+        if ('resume_pkl' not in c) and (opts.transfer is None) and (opts.resume is None):
+            c.resume_pkl = opts.teacher
+            c.ema_rampup_ratio = None
+
     # Network options.
     if opts.cbase is not None:
         c.network_kwargs.model_channels = opts.cbase
@@ -179,6 +233,8 @@ def main(**kwargs):
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
     dtype_str = 'fp16' if c.network_kwargs.use_fp16 else 'fp32'
     desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
+    if opts.consistency:
+        desc += f'-cdS{opts.S}-T{opts.T_start}-{opts.T_end}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 
@@ -207,6 +263,7 @@ def main(**kwargs):
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Network architecture:    {opts.arch}')
     dist.print0(f'Preconditioning & loss:  {opts.precond}')
+    dist.print0(f'Consistency Distill:     {opts.consistency}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
