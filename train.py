@@ -192,10 +192,8 @@ def main(**kwargs):
         # Provenance and optional eval knob (stored only).
         c.teacher = opts.teacher
         c.snap_cd_eval = opts.snap_cd_eval
-        # If user did not specify transfer/resume, seed student from teacher EMA by default.
-        if ('resume_pkl' not in c) and (opts.transfer is None) and (opts.resume is None):
-            c.resume_pkl = opts.teacher
-            c.ema_rampup_ratio = None
+        # Note: do NOT auto-seed student weights from teacher by default to avoid
+        # label embedding shape mismatches across checkpoints/datasets.
 
     # Network options.
     if opts.cbase is not None:

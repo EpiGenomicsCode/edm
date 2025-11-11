@@ -86,6 +86,51 @@ def training_loop(
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
+    # Debug: compare teacher vs student shapes when doing consistency distillation.
+    if dist.get_rank() == 0 and hasattr(loss_fn, 'teacher_net'):
+        try:
+            teacher = loss_fn.teacher_net
+            dist.print0('[CD DEBUG] Teacher vs Student diagnostic:')
+            dist.print0(f'[CD DEBUG]   teacher class: {type(teacher).__name__}')
+            dist.print0(f'[CD DEBUG]   student class: {type(net).__name__}')
+            t_label_dim = getattr(teacher, 'label_dim', None)
+            s_label_dim = getattr(net, 'label_dim', None)
+            dist.print0(f'[CD DEBUG]   teacher label_dim: {t_label_dim}')
+            dist.print0(f'[CD DEBUG]   student label_dim: {s_label_dim}')
+            # Grab a likely label-related param name and shape.
+            def _first_label_param(mod):
+                for n, p in mod.named_parameters():
+                    if 'label' in n or 'map_label' in n:
+                        return n, tuple(p.shape)
+                return None, None
+            t_lp_name, t_lp_shape = _first_label_param(teacher)
+            s_lp_name, s_lp_shape = _first_label_param(net)
+            dist.print0(f'[CD DEBUG]   teacher label param: {t_lp_name} {t_lp_shape}')
+            dist.print0(f'[CD DEBUG]   student label param: {s_lp_name} {s_lp_shape}')
+            # Parameter/buffer shape comparison.
+            def _shapes(mod):
+                d = {}
+                for n, p in mod.named_parameters():
+                    d[n] = tuple(p.shape)
+                for n, b in mod.named_buffers():
+                    d[n] = tuple(b.shape)
+                return d
+            t_shapes = _shapes(teacher)
+            s_shapes = _shapes(net)
+            mismatches = []
+            for name, tshape in t_shapes.items():
+                sshape = s_shapes.get(name)
+                if sshape is None:
+                    mismatches.append((name, tshape, 'MISSING'))
+                elif sshape != tshape:
+                    mismatches.append((name, tshape, sshape))
+            dist.print0(f'[CD DEBUG]   total teacher tensors: {len(t_shapes)}; student tensors: {len(s_shapes)}; mismatches: {len(mismatches)}')
+            for i, (n, tsh, ssh) in enumerate(mismatches[:30]):
+                dist.print0(f'[CD DEBUG]     {i+1:02d}: {n}: teacher{tsh} vs student{ssh}')
+            if len(mismatches) > 30:
+                dist.print0(f'[CD DEBUG]   ... and {len(mismatches)-30} more mismatches')
+        except Exception as _e:
+            dist.print0(f'[CD DEBUG]   diagnostics failed: {_e}')
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
