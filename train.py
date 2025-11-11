@@ -337,6 +337,10 @@ def main(**kwargs):
         c.wandb_config = None
 
     # Train.
+    # Remove non-API keys before invoking training loop.
+    for k in ['teacher', 'snap_cd_eval']:
+        if k in c:
+            del c[k]
     training_loop.training_loop(**c)
 
 #----------------------------------------------------------------------------
