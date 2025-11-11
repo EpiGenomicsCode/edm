@@ -129,6 +129,20 @@ def main(**kwargs):
         dataset_name = dataset_obj.name
         c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
         c.dataset_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
+        # Debug: dataset label diagnostics.
+        dist.print0(f'Dataset has_labels={dataset_obj.has_labels}, label_dim={getattr(dataset_obj, "label_dim", None)}')
+        # If possible, peek into dataset.json to count unique labels.
+        try:
+            import zipfile, json as _json
+            if isinstance(c.dataset_kwargs.path, str) and c.dataset_kwargs.path.endswith('.zip') and os.path.isfile(c.dataset_kwargs.path):
+                with zipfile.ZipFile(c.dataset_kwargs.path, 'r') as zf:
+                    if 'dataset.json' in zf.namelist():
+                        with zf.open('dataset.json') as f:
+                            meta = _json.load(f)
+                            labels = meta.get('labels')
+                            if labels is not None:
+                                uniq = sorted({int(lbl) for _, lbl in labels if lbl is not None})
+                                dist.print0(f'Dataset.json unique label count={len(uniq)}, min={uniq[0] if uniq else None}, max={uniq[-1] if uniq else None}')
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
         del dataset_obj # conserve memory

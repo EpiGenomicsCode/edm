@@ -103,12 +103,16 @@ class EDMConsistencyDistillLoss:
 
     def _build_student_grid(self, net, device: torch.device) -> torch.Tensor:
         # Student requires S+1 descending positive sigmas; conceptual 0 boundary handled separately.
+        # net may be wrapped in DDP; grab underlying module's round_sigma if needed.
+        round_fn = getattr(net, 'round_sigma', None)
+        if round_fn is None and hasattr(net, 'module'):
+            round_fn = getattr(net.module, 'round_sigma', None)
         sigmas = make_karras_sigmas(
             num_nodes=self.S + 1,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
             rho=self.rho,
-            round_fn=net.round_sigma,
+            round_fn=round_fn,
         ).to(device)
         return sigmas
 
