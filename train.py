@@ -143,6 +143,8 @@ def main(**kwargs):
                             if labels is not None:
                                 uniq = sorted({int(lbl) for _, lbl in labels if lbl is not None})
                                 dist.print0(f'Dataset.json unique label count={len(uniq)}, min={uniq[0] if uniq else None}, max={uniq[-1] if uniq else None}')
+        except Exception as _e:
+            dist.print0(f'Dataset label diagnostics skipped: {_e}')
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
         del dataset_obj # conserve memory
