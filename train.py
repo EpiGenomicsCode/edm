@@ -15,6 +15,7 @@ import click
 import torch
 import dnnlib
 import pickle
+import copy
 from torch_utils import distributed as dist
 from training import training_loop
 
@@ -264,7 +265,7 @@ def main(**kwargs):
     dist.print0()
     dist.print0('Training options:')
     # Sanitize non-serializable fields for printing.
-    c_print = dnnlib.EasyDict(c)
+    c_print = copy.deepcopy(c)
     if 'loss_kwargs' in c_print and isinstance(c_print.loss_kwargs, dnnlib.EasyDict) and 'teacher_net' in c_print.loss_kwargs:
         c_print.loss_kwargs.teacher_net = 'FROZEN_TEACHER'
     dist.print0(json.dumps(c_print, indent=2))
@@ -290,7 +291,7 @@ def main(**kwargs):
     if dist.get_rank() == 0:
         os.makedirs(c.run_dir, exist_ok=True)
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
-            c_save = dnnlib.EasyDict(c)
+            c_save = copy.deepcopy(c)
             if 'loss_kwargs' in c_save and isinstance(c_save.loss_kwargs, dnnlib.EasyDict) and 'teacher_net' in c_save.loss_kwargs:
                 c_save.loss_kwargs.teacher_net = 'FROZEN_TEACHER'
             json.dump(c_save, f, indent=2)
