@@ -263,7 +263,11 @@ def main(**kwargs):
     # Print options.
     dist.print0()
     dist.print0('Training options:')
-    dist.print0(json.dumps(c, indent=2))
+    # Sanitize non-serializable fields for printing.
+    c_print = dnnlib.EasyDict(c)
+    if 'loss_kwargs' in c_print and isinstance(c_print.loss_kwargs, dnnlib.EasyDict) and 'teacher_net' in c_print.loss_kwargs:
+        c_print.loss_kwargs.teacher_net = 'FROZEN_TEACHER'
+    dist.print0(json.dumps(c_print, indent=2))
     dist.print0()
     dist.print0(f'Output directory:        {c.run_dir}')
     dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
@@ -286,7 +290,10 @@ def main(**kwargs):
     if dist.get_rank() == 0:
         os.makedirs(c.run_dir, exist_ok=True)
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
-            json.dump(c, f, indent=2)
+            c_save = dnnlib.EasyDict(c)
+            if 'loss_kwargs' in c_save and isinstance(c_save.loss_kwargs, dnnlib.EasyDict) and 'teacher_net' in c_save.loss_kwargs:
+                c_save.loss_kwargs.teacher_net = 'FROZEN_TEACHER'
+            json.dump(c_save, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Prepare W&B integration (optional).
