@@ -20,6 +20,9 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
 
+# Validation hook.
+from validation import maybe_validate
+
 #----------------------------------------------------------------------------
 
 def training_loop(
@@ -48,6 +51,7 @@ def training_loop(
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
+    validation_kwargs   = None,     # Validation configuration (PRD-04).
 ):
     # Initialize.
     start_time = time.time()
@@ -141,9 +145,8 @@ def training_loop(
     if wandb_kwargs is not None and wandb_kwargs.get('enabled', False) and dist.get_rank() == 0:
         try:
             import wandb as _wandb
-            # Prefer thread start method to avoid forking stalls.
-            if os.environ.get('WANDB_START_METHOD') is None:
-                os.environ['WANDB_START_METHOD'] = 'thread'
+            # Make W&B robust with our stdout redirection: avoid isatty uses.
+            os.environ.setdefault('WANDB_CONSOLE', 'off')
             init_kwargs = dict(
                 project=wandb_kwargs.get('project', 'edm-consistency'),
                 entity=wandb_kwargs.get('entity', None),
@@ -153,7 +156,12 @@ def training_loop(
             mode = wandb_kwargs.get('mode', 'online')
             if mode in ('offline', 'disabled'):
                 init_kwargs['mode'] = mode
-            wandb_run = _wandb.init(**init_kwargs, config=wandb_config)
+            # Pass settings to avoid console/tty assumptions.
+            try:
+                settings = _wandb.Settings(console='off')
+                wandb_run = _wandb.init(**init_kwargs, config=wandb_config, settings=settings)
+            except Exception:
+                wandb_run = _wandb.init(**init_kwargs, config=wandb_config)
         except Exception as _e:
             dist.print0(f'[W&B] init failed: {_e}')
             wandb_run = None
@@ -299,6 +307,21 @@ def training_loop(
                 except Exception as _e:
                     dist.print0(f'[W&B] log failed: {_e}')
         dist.update_progress(cur_nimg // 1000, total_kimg)
+
+        # Built-in validation hook (runs on schedule; blocks training).
+        try:
+            cur_kimg = cur_nimg // 1000
+            maybe_validate(
+                step_tick=cur_tick,
+                step_kimg=int(cur_kimg),
+                net_ema=ema,
+                run_dir=run_dir,
+                dataset_kwargs=dataset_kwargs,
+                validation_kwargs=validation_kwargs,
+                wandb_run=wandb_run,
+            )
+        except Exception as _e:
+            dist.print0(f'[VAL] validation failed: {_e}')
 
         # Update state.
         cur_tick += 1

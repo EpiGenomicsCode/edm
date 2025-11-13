@@ -100,6 +100,21 @@ def parse_int_list(s):
 @click.option('--wandb_tags',    help='W&B tags (comma-separated)', metavar='STR',                  type=str)
 @click.option('--wandb_mode',    help='W&B mode: online|offline|disabled', metavar='STR',           type=click.Choice(['online','offline','disabled']), default='online', show_default=True)
 
+# Validation (PRD-04).
+@click.option('--val',           help='Enable periodic validation (FID)', metavar='BOOL',            type=bool, default=True, show_default=True)
+@click.option('--val_ref',       help='FID reference stats (.npz or URL)', metavar='NPZ|URL',        type=str)
+@click.option('--val_ref_data',  help='Dataset path to compute reference', metavar='PATH',           type=str)
+@click.option('--val_every',     help='Validate every N ticks (default=snap)', metavar='TICKS',      type=click.IntRange(min=1))
+@click.option('--val_num',       help='Number of images for validation', metavar='INT',              type=click.IntRange(min=2), default=50000, show_default=True)
+@click.option('--val_seed',      help='Validation base seed', metavar='INT',                         type=int, default=0, show_default=True)
+@click.option('--val_batch',     help='Validation batch size per GPU', metavar='INT',                type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--val_steps',     help='Validation sampler steps', metavar='INT',                     type=click.IntRange(min=1), default=16, show_default=True)
+@click.option('--val_sampler',   help='Sampler kind', metavar='edm|ablate',                          type=click.Choice(['edm','ablate']), default='edm', show_default=True)
+@click.option('--val_label',     help='Label mode', metavar='auto|uniform|dataset|fixed:K',         type=str, default='auto', show_default=True)
+@click.option('--val_dump_images_dir', help='Optional: dump validation images', metavar='DIR',       type=str)
+@click.option('--val_overwrite', help='Overwrite existing val_{kimg}.json', metavar='BOOL',          type=bool, default=False, show_default=True)
+@click.option('--val_at_start',  help='Run validation at start (tick 0)', metavar='BOOL',            type=bool, default=False, show_default=True)
+
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
     paper "Elucidating the Design Space of Diffusion-Based Generative Models".
@@ -216,9 +231,13 @@ def main(**kwargs):
         c.network_kwargs.model_channels = opts.cbase
     if opts.cres is not None:
         c.network_kwargs.channel_mult = opts.cres
-    if opts.augment:
+    # Augmentation policy:
+    # For consistency distillation (esp. ImageNet-64), disable augmentation to match paper setup
+    # and keep student identical to teacher (avoid augment_dim mismatch).
+    if (not opts.consistency) and opts.augment:
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
         c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
+        # Only set augment_dim when we actually use AugmentPipe.
         c.network_kwargs.augment_dim = 9
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
 
@@ -350,6 +369,30 @@ def main(**kwargs):
     else:
         c.wandb_kwargs = None
         c.wandb_config = None
+
+    # Validation configuration (PRD-04).
+    c.validation_kwargs = dnnlib.EasyDict(
+        enabled=opts.val,
+        every=opts.val_every or c.snapshot_ticks,
+        num_images=opts.val_num,
+        seed=opts.val_seed,
+        batch=opts.val_batch,
+        sampler=dict(
+            kind=opts.val_sampler,
+            num_steps=opts.val_steps,
+            sigma_min=opts.sigma_min,
+            sigma_max=opts.sigma_max,
+            rho=opts.rho,
+            # ImageNet defaults per README for teacher recipe; student differs only in steps.
+            S_churn=40, S_min=0.05, S_max=50.0, S_noise=1.003,
+        ),
+        labels=opts.val_label,
+        ref=opts.val_ref,
+        ref_data=opts.val_ref_data,
+        dump_images_dir=opts.val_dump_images_dir,
+        overwrite=opts.val_overwrite,
+        at_start=opts.val_at_start,
+    )
 
     # Train.
     # Remove non-API keys before invoking training loop.
