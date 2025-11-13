@@ -84,7 +84,6 @@ def run_fid_validation(
     wandb_run: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Compute FID by generating images with the current EMA network."""
-    dist.init()
     device = torch.device('cuda')
     world_size = dist.get_world_size()
     rank = dist.get_rank()
