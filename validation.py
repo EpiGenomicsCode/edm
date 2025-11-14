@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any
 
 from torch_utils import distributed as dist
 from torch_utils import misc
+import tqdm
 
 # Reuse existing samplers & helpers.
 from generate import edm_sampler, ablation_sampler, StackedRandomGenerator
@@ -117,6 +118,9 @@ def run_fid_validation(
     all_batches = all_indices.tensor_split(num_batches)
     rank_batches = all_batches[rank :: world_size]
 
+    if rank == 0:
+        dist.print0(f'[VAL] Starting validation: num_images={num_images}, batches/world={num_batches}, batch_per_gpu={batch}')
+
     # Accumulators in FP64.
     mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
     sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64, device=device)
@@ -131,7 +135,8 @@ def run_fid_validation(
         effective_mode = 'none'
 
     # Iterate rank-local batches.
-    for b_idxs in rank_batches:
+    progress = tqdm.tqdm(rank_batches, unit='batch', disable=(rank != 0))
+    for b_idxs in progress:
         torch.distributed.barrier()
         bsize = len(b_idxs)
         if bsize == 0:
@@ -250,10 +255,12 @@ def maybe_validate(
     every = int(validation_kwargs.get('every', 0) or 0)
     at_start = bool(validation_kwargs.get('at_start', False))
     should_run = False
-    if step_tick == 0 and at_start:
-        should_run = True
-    elif every > 0 and (step_tick % every == 0):
-        should_run = True
+    # Only run at tick 0 if explicitly requested via at_start.
+    if step_tick == 0:
+        should_run = at_start
+    else:
+        if every > 0 and (step_tick % every == 0):
+            should_run = True
     if not should_run:
         return
     # Broadcast a shared decision (bool -> int tensor).

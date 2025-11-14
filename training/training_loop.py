@@ -22,7 +22,7 @@ from torch_utils import training_stats
 from torch_utils import misc
 
 # Validation hook.
-from validation import maybe_validate
+from validation import maybe_validate, run_fid_validation
 
 #----------------------------------------------------------------------------
 
@@ -193,6 +193,51 @@ def training_loop(
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
         del data # conserve memory
+
+    # One-time teacher validation (baseline) using ImageNet defaults if available.
+    try:
+        if (validation_kwargs is not None and validation_kwargs.get('enabled', True) and hasattr(loss_fn, 'teacher_net')):
+            teacher_done_flag = os.path.join(run_dir, 'val_teacher.json')
+            should_run_teacher = True
+            if dist.get_rank() == 0 and os.path.isfile(teacher_done_flag):
+                should_run_teacher = False
+            # Broadcast decision.
+            flag_tensor = torch.tensor([1 if should_run_teacher else 0], dtype=torch.int64, device=device)
+            torch.distributed.broadcast(flag_tensor, src=0)
+            if int(flag_tensor.item()) == 1:
+                teacher_net = loss_fn.teacher_net
+                # Teacher sampler defaults per README ImageNet.
+                teacher_sampler = dict(
+                    kind='edm',
+                    num_steps=256,
+                    sigma_min=float(getattr(teacher_net, 'sigma_min', 0.002)),
+                    sigma_max=float(getattr(teacher_net, 'sigma_max', 80.0)),
+                    rho=7.0,
+                    S_churn=40, S_min=0.05, S_max=50.0, S_noise=1.003,
+                )
+                dist.print0('[VAL] Running one-time teacher validation (ImageNet defaults)...')
+                result = run_fid_validation(
+                    teacher_net,
+                    run_dir=run_dir,
+                    dataset_kwargs=dataset_kwargs,
+                    num_images=int(validation_kwargs.get('num_images', 50000)),
+                    batch=int(validation_kwargs.get('batch', 64)),
+                    seed=int(validation_kwargs.get('seed', 0)),
+                    sampler=teacher_sampler,
+                    labels='auto',
+                    ref=validation_kwargs.get('ref', None),
+                    ref_data=validation_kwargs.get('ref_data', None),
+                    dump_images_dir=None,
+                    overwrite=False,
+                    step_kimg=None,
+                    wandb_run=wandb_run,
+                )
+                if dist.get_rank() == 0:
+                    payload = dict(fid=result.get('fid'), sampler=teacher_sampler)
+                    with open(teacher_done_flag, 'wt') as f:
+                        json.dump(payload, f)
+    except Exception as _e:
+        dist.print0(f'[VAL] teacher validation failed: {_e}')
 
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
