@@ -16,6 +16,7 @@ import psutil
 import numpy as np
 import torch
 import dnnlib
+import sys
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
@@ -147,6 +148,14 @@ def training_loop(
             import wandb as _wandb
             # Make W&B robust with our stdout redirection: avoid isatty uses.
             os.environ.setdefault('WANDB_CONSOLE', 'off')
+            # Provide isatty() when stdout/stderr are our custom Logger without it.
+            try:
+                if not hasattr(sys.stdout, 'isatty'):
+                    sys.stdout.isatty = lambda: False
+                if not hasattr(sys.stderr, 'isatty'):
+                    sys.stderr.isatty = lambda: False
+            except Exception:
+                pass
             init_kwargs = dict(
                 project=wandb_kwargs.get('project', 'edm-consistency'),
                 entity=wandb_kwargs.get('entity', None),
