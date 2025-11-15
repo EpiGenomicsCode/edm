@@ -139,12 +139,20 @@ def run_fid_validation(
         effective_mode = 'none'
 
     # Iterate rank-local batches.
-    progress = tqdm.tqdm(rank_batches, unit='batch', disable=(rank != 0), ascii=True, mininterval=5.0, miniters=1, dynamic_ncols=False)
+    # Rank-local batch list and simple counters for explicit progress logs.
+    rank_batches_list = list(rank_batches)
+    non_empty_rank_batches = sum(1 for b in rank_batches_list if len(b) > 0)
+    progress = tqdm.tqdm(rank_batches_list, unit='batch', disable=(rank != 0), ascii=True, mininterval=5.0, miniters=1, dynamic_ncols=False)
+    local_batch_idx = 0
     for b_idxs in progress:
         torch.distributed.barrier()
         bsize = len(b_idxs)
         if bsize == 0:
             continue
+        local_batch_idx += 1
+        if rank == 0 and (local_batch_idx == 1 or (local_batch_idx % 10 == 0) or (local_batch_idx == non_empty_rank_batches)):
+            pct = 100.0 * local_batch_idx / max(non_empty_rank_batches, 1)
+            dist.print0(f'[VAL] Progress (rank0): {local_batch_idx}/{non_empty_rank_batches} ({pct:.1f}%)')
         # Per-sample seeds are base + index.
         seeds = (seed + b_idxs).tolist()
         rnd = StackedRandomGenerator(device, seeds)
