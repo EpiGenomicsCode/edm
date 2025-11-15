@@ -88,6 +88,8 @@ def run_fid_validation(
     device = torch.device('cuda')
     world_size = dist.get_world_size()
     rank = dist.get_rank()
+    t0 = time.time() if 'time' in globals() else __import__('time').time()
+    dist.print0(f'[VAL DEBUG] enter run_fid_validation: world={world_size} rank={rank} num_images={num_images} batch={batch}')
 
     # Short-circuit if snapshot for this step exists and overwrite is False.
     if (step_kimg is not None) and (rank == 0):
@@ -104,17 +106,22 @@ def run_fid_validation(
     except Exception:
         pass
     net = net.eval().requires_grad_(False).to(device)
+    dist.print0(f'[VAL DEBUG] after DDP consistency check; elapsed {(__import__("time").time()-t0):.1f}s')
 
     # Reference stats.
     cache_dir = os.path.join(run_dir, 'fid-refs')
+    dist.print0('[VAL DEBUG] loading reference stats...')
     mu_ref, sigma_ref = _prepare_reference_stats(ref, ref_data, batch=batch, device=device, seed=seed, cache_dir=cache_dir)
+    dist.print0(f'[VAL DEBUG] reference loaded; elapsed {(__import__("time").time()-t0):.1f}s')
 
     # Inception on each rank, rank 0 goes first (mirror fid.py barrier pattern).
     if dist.get_rank() != 0:
         torch.distributed.barrier()
+    dist.print0('[VAL DEBUG] before inception load (rank0 will print the loader message next)')
     detector, detector_kwargs, feature_dim = _load_inception_detector(device)
     if dist.get_rank() == 0:
         torch.distributed.barrier()
+    dist.print0(f'[VAL DEBUG] inception ready; elapsed {(__import__("time").time()-t0):.1f}s')
 
     # Seed assignment and sharding.
     all_indices = torch.arange(num_images, device=torch.device('cpu'))
@@ -124,6 +131,7 @@ def run_fid_validation(
 
     if rank == 0:
         dist.print0(f'[VAL] Starting validation: num_images={num_images}, batches/world={num_batches}, batch_per_gpu={batch}')
+        dist.print0(f'[VAL DEBUG] rank0 has {sum(1 for b in rank_batches if len(b)>0)} non-empty batches')
 
     # Accumulators in FP64.
     mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
