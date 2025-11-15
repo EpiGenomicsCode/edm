@@ -194,6 +194,16 @@ def training_loop(
         optimizer.load_state_dict(data['optimizer_state'])
         del data # conserve memory
 
+    # Broadcast run_dir to all ranks (rank 0 has it, others have None).
+    if dist.get_rank() == 0:
+        run_dir_str = run_dir if run_dir is not None else ''
+    else:
+        run_dir_str = ''
+    # Use object list broadcast.
+    run_dir_list = [run_dir_str]
+    torch.distributed.broadcast_object_list(run_dir_list, src=0)
+    run_dir = run_dir_list[0] if run_dir_list[0] else None
+    
     # One-time teacher validation (baseline) using ImageNet defaults if available.
     try:
         if (validation_kwargs is not None and validation_kwargs.get('enabled', True) and hasattr(loss_fn, 'teacher_net')):
@@ -208,7 +218,7 @@ def training_loop(
             torch.distributed.broadcast(flag_tensor, src=0)
             should_run_teacher = bool(flag_tensor.item())
             # All ranks print for debugging.
-            print(f'[VAL DEBUG] rank={dist.get_rank()} teacher_flag={int(flag_tensor.item())}', flush=True)
+            print(f'[VAL DEBUG] rank={dist.get_rank()} teacher_flag={int(flag_tensor.item())} run_dir={run_dir}', flush=True)
             # Global sync so either all enter validation together or none do.
             torch.distributed.barrier()
             if should_run_teacher:
