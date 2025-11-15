@@ -22,30 +22,38 @@ from fid import calculate_fid_from_inception_stats, calculate_inception_stats
 #----------------------------------------------------------------------------
 
 def _load_inception_detector(device: torch.device):
-    # Same weights & structure as fid.py, but allow local override to avoid slow/broken HTTP on clusters.
+    # Copied verbatim from fid.py with rank-0-first barrier pattern.
     import dnnlib as _dnnlib
     import pickle as _pickle
+    
+    # Rank 0 goes first.
+    if dist.get_rank() != 0:
+        torch.distributed.barrier()
+    
     detector_kwargs = dict(return_features=True)
     feature_dim = 2048
-
-    # 1) Optional local override: env var or metrics/ path.
+    
+    # Optional local override to avoid slow/blocked HTTP on clusters.
     local_path = os.environ.get('EDM_INCEPTION_PATH', None)
     if local_path is None:
-        # Try repo-local metrics folder if present.
         repo_local = os.path.join(os.path.dirname(__file__), 'metrics', 'inception-2015-12-05.pkl')
         if os.path.isfile(repo_local):
             local_path = repo_local
+    
     if local_path is not None and os.path.isfile(local_path):
         dist.print0(f'Loading Inception-v3 model from local file "{local_path}"...')
         with open(local_path, 'rb') as f:
             detector_net = _pickle.load(f).to(device)
-        return detector_net, detector_kwargs, feature_dim
-
-    # 2) Fallback to original URL (fid.py behavior).
-    dist.print0('Loading Inception-v3 model from NGC URL (may be slow or blocked on this cluster)...')
-    detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
-    with _dnnlib.util.open_url(detector_url, verbose=(dist.get_rank() == 0)) as f:
-        detector_net = _pickle.load(f).to(device)
+    else:
+        dist.print0('Loading Inception-v3 model from NGC URL...')
+        detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
+        with _dnnlib.util.open_url(detector_url, verbose=(dist.get_rank() == 0)) as f:
+            detector_net = _pickle.load(f).to(device)
+    
+    # Other ranks follow.
+    if dist.get_rank() == 0:
+        torch.distributed.barrier()
+    
     return detector_net, detector_kwargs, feature_dim
 
 #----------------------------------------------------------------------------
