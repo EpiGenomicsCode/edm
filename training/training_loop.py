@@ -203,9 +203,19 @@ def training_loop(
                 should_run_teacher = False
             # Broadcast decision.
             flag_tensor = torch.tensor([1 if should_run_teacher else 0], dtype=torch.int64, device=device)
+            dist.print0('[VAL DEBUG] Teacher gate: broadcasting should_run flag...')
             torch.distributed.broadcast(flag_tensor, src=0)
+            try:
+                # Print per-rank for debugging.
+                print(f'[VAL DEBUG] rank={dist.get_rank()} teacher_flag={int(flag_tensor.item())}', flush=True)
+            except Exception:
+                pass
             if int(flag_tensor.item()) == 1:
                 teacher_net = loss_fn.teacher_net
+                try:
+                    print(f'[VAL DEBUG] rank=a{dist.get_rank()} entering teacher run_fid_validation', flush=True)
+                except Exception:
+                    pass
                 # Teacher sampler defaults per README ImageNet.
                 teacher_sampler = dict(
                     kind='edm',
