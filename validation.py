@@ -135,14 +135,14 @@ def run_fid_validation(
 
     # Reference stats.
     cache_dir = os.path.join(run_dir, 'fid-refs')
-    dist.print0('[VAL DEBUG] loading reference stats...')
+    print(f'[VAL DEBUG] rank={rank} loading reference stats...', flush=True)
     mu_ref, sigma_ref = _prepare_reference_stats(ref, ref_data, batch=batch, device=device, seed=seed, cache_dir=cache_dir)
-    dist.print0(f'[VAL DEBUG] reference loaded; elapsed {(__import__("time").time()-t0):.1f}s')
+    print(f'[VAL DEBUG] rank={rank} reference loaded; elapsed {(__import__("time").time()-t0):.1f}s', flush=True)
 
     # Inception on each rank (_load_inception_detector has its own rank-0-first barriers).
-    dist.print0('[VAL DEBUG] before inception load (rank0 will print the loader message next)')
+    print(f'[VAL DEBUG] rank={rank} before inception load', flush=True)
     detector, detector_kwargs, feature_dim = _load_inception_detector(device)
-    dist.print0(f'[VAL DEBUG] inception ready; elapsed {(__import__("time").time()-t0):.1f}s')
+    print(f'[VAL DEBUG] rank={rank} inception ready; elapsed {(__import__("time").time()-t0):.1f}s', flush=True)
 
     # Seed assignment and sharding.
     all_indices = torch.arange(num_images, device=torch.device('cpu'))
