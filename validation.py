@@ -109,8 +109,12 @@ def run_fid_validation(
     cache_dir = os.path.join(run_dir, 'fid-refs')
     mu_ref, sigma_ref = _prepare_reference_stats(ref, ref_data, batch=batch, device=device, seed=seed, cache_dir=cache_dir)
 
-    # Inception on each rank.
+    # Inception on each rank, rank 0 goes first (mirror fid.py barrier pattern).
+    if dist.get_rank() != 0:
+        torch.distributed.barrier()
     detector, detector_kwargs, feature_dim = _load_inception_detector(device)
+    if dist.get_rank() == 0:
+        torch.distributed.barrier()
 
     # Seed assignment and sharding.
     all_indices = torch.arange(num_images, device=torch.device('cpu'))
@@ -135,7 +139,7 @@ def run_fid_validation(
         effective_mode = 'none'
 
     # Iterate rank-local batches.
-    progress = tqdm.tqdm(rank_batches, unit='batch', disable=(rank != 0))
+    progress = tqdm.tqdm(rank_batches, unit='batch', disable=(rank != 0), ascii=True, mininterval=5.0, miniters=1, dynamic_ncols=False)
     for b_idxs in progress:
         torch.distributed.barrier()
         bsize = len(b_idxs)
