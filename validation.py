@@ -27,10 +27,8 @@ def _load_inception_detector(device: torch.device):
     import pickle as _pickle
     
     # Rank 0 goes first.
-    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} before first barrier', flush=True)
     if dist.get_rank() != 0:
         torch.distributed.barrier()
-    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} after first barrier (or skipped if rank0)', flush=True)
     
     detector_kwargs = dict(return_features=True)
     feature_dim = 2048
@@ -42,22 +40,19 @@ def _load_inception_detector(device: torch.device):
         if os.path.isfile(repo_local):
             local_path = repo_local
     
-    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} about to load from {local_path or "URL"}', flush=True)
     if local_path is not None and os.path.isfile(local_path):
         dist.print0(f'Loading Inception-v3 model from local file "{local_path}"...')
         with open(local_path, 'rb') as f:
             detector_net = _pickle.load(f).to(device)
     else:
-        dist.print0('Loading Inception-v3 model from NGC URL...')
+        dist.print0('Loading Inception-v3 model...')
         detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
         with _dnnlib.util.open_url(detector_url, verbose=(dist.get_rank() == 0)) as f:
             detector_net = _pickle.load(f).to(device)
     
-    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} loaded detector, about to hit second barrier', flush=True)
     # Other ranks follow.
     if dist.get_rank() == 0:
         torch.distributed.barrier()
-    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} after second barrier (or skipped if rank0)', flush=True)
     
     return detector_net, detector_kwargs, feature_dim
 
@@ -71,7 +66,6 @@ def _prepare_reference_stats(ref: Optional[str], ref_data: Optional[str], *, bat
         mu_ref = None
         sigma_ref = None
         if dist.get_rank() == 0:
-            dist.print0(f'[VAL DEBUG] Loading ref from \"{ref}\"...')
             with dnnlib.util.open_url(ref) as f:
                 ref_npz = dict(np.load(f))
                 mu_ref = ref_npz['mu']
@@ -113,17 +107,14 @@ def run_fid_validation(
     device = torch.device('cuda')
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    t0 = time.time() if 'time' in globals() else __import__('time').time()
-    dist.print0(f'[VAL DEBUG] enter run_fid_validation: world={world_size} rank={rank} num_images={num_images} batch={batch}')
 
     # Short-circuit if snapshot for this step exists and overwrite is False.
     if (step_kimg is not None) and (rank == 0):
         step_json = os.path.join(run_dir, f'val_{int(step_kimg):06d}.json')
         if (not overwrite) and os.path.isfile(step_json):
-            dist.print0(f'[VAL] Skipping validation at kimg={step_kimg} because results already exist.')
+            dist.print0(f'[VAL] Skipping validation at kimg={step_kimg} (results exist).')
             torch.distributed.barrier()
             return {}
-    # Note: barrier synchronization is performed before entering this function.
 
     # Ensure EMA is synchronized across ranks before validation.
     try:
@@ -131,18 +122,13 @@ def run_fid_validation(
     except Exception:
         pass
     net = net.eval().requires_grad_(False).to(device)
-    dist.print0(f'[VAL DEBUG] after DDP consistency check; elapsed {(__import__("time").time()-t0):.1f}s')
 
     # Reference stats.
     cache_dir = os.path.join(run_dir, 'fid-refs')
-    print(f'[VAL DEBUG] rank={rank} loading reference stats...', flush=True)
     mu_ref, sigma_ref = _prepare_reference_stats(ref, ref_data, batch=batch, device=device, seed=seed, cache_dir=cache_dir)
-    print(f'[VAL DEBUG] rank={rank} reference loaded; elapsed {(__import__("time").time()-t0):.1f}s', flush=True)
 
     # Inception on each rank (_load_inception_detector has its own rank-0-first barriers).
-    print(f'[VAL DEBUG] rank={rank} before inception load', flush=True)
     detector, detector_kwargs, feature_dim = _load_inception_detector(device)
-    print(f'[VAL DEBUG] rank={rank} inception ready; elapsed {(__import__("time").time()-t0):.1f}s', flush=True)
 
     # Seed assignment and sharding.
     all_indices = torch.arange(num_images, device=torch.device('cpu'))
@@ -150,9 +136,7 @@ def run_fid_validation(
     all_batches = all_indices.tensor_split(num_batches)
     rank_batches = all_batches[rank :: world_size]
 
-    if rank == 0:
-        dist.print0(f'[VAL] Starting validation: num_images={num_images}, batches/world={num_batches}, batch_per_gpu={batch}')
-        dist.print0(f'[VAL DEBUG] rank0 has {sum(1 for b in rank_batches if len(b)>0)} non-empty batches')
+    dist.print0(f'[VAL] Starting validation: num_images={num_images}, batches={num_batches}, batch_per_gpu={batch}')
 
     # Accumulators in FP64.
     mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)

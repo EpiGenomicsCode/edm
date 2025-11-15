@@ -212,21 +212,14 @@ def training_loop(
             if dist.get_rank() == 0:
                 teacher_done_flag = os.path.join(run_dir, 'val_teacher.json')
                 should_run_teacher = not os.path.isfile(teacher_done_flag)
-                dist.print0(f'[VAL DEBUG] Teacher gate: rank0 decision={should_run_teacher}')
             # Broadcast decision from rank 0.
             flag_tensor = torch.tensor([1 if should_run_teacher else 0], dtype=torch.int64, device=device)
             torch.distributed.broadcast(flag_tensor, src=0)
             should_run_teacher = bool(flag_tensor.item())
-            # All ranks print for debugging.
-            print(f'[VAL DEBUG] rank={dist.get_rank()} teacher_flag={int(flag_tensor.item())} run_dir={run_dir}', flush=True)
             # Global sync so either all enter validation together or none do.
             torch.distributed.barrier()
             if should_run_teacher:
                 teacher_net = loss_fn.teacher_net
-                try:
-                    print(f'[VAL DEBUG] rank=a{dist.get_rank()} entering teacher run_fid_validation', flush=True)
-                except Exception:
-                    pass
                 # Teacher sampler defaults per README ImageNet.
                 teacher_sampler = dict(
                     kind='edm',
