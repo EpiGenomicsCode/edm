@@ -197,22 +197,21 @@ def training_loop(
     # One-time teacher validation (baseline) using ImageNet defaults if available.
     try:
         if (validation_kwargs is not None and validation_kwargs.get('enabled', True) and hasattr(loss_fn, 'teacher_net')):
-            teacher_done_flag = os.path.join(run_dir, 'val_teacher.json')
-            should_run_teacher = True
-            if dist.get_rank() == 0 and os.path.isfile(teacher_done_flag):
-                should_run_teacher = False
-            # Broadcast decision.
+            # Rank 0 decides; broadcast to all.
+            should_run_teacher = False
+            if dist.get_rank() == 0:
+                teacher_done_flag = os.path.join(run_dir, 'val_teacher.json')
+                should_run_teacher = not os.path.isfile(teacher_done_flag)
+                dist.print0(f'[VAL DEBUG] Teacher gate: rank0 decision={should_run_teacher}')
+            # Broadcast decision from rank 0.
             flag_tensor = torch.tensor([1 if should_run_teacher else 0], dtype=torch.int64, device=device)
-            dist.print0('[VAL DEBUG] Teacher gate: broadcasting should_run flag...')
             torch.distributed.broadcast(flag_tensor, src=0)
-            try:
-                # Print per-rank for debugging.
-                print(f'[VAL DEBUG] rank={dist.get_rank()} teacher_flag={int(flag_tensor.item())}', flush=True)
-            except Exception:
-                pass
+            should_run_teacher = bool(flag_tensor.item())
+            # All ranks print for debugging.
+            print(f'[VAL DEBUG] rank={dist.get_rank()} teacher_flag={int(flag_tensor.item())}', flush=True)
             # Global sync so either all enter validation together or none do.
             torch.distributed.barrier()
-            if int(flag_tensor.item()) == 1:
+            if should_run_teacher:
                 teacher_net = loss_fn.teacher_net
                 try:
                     print(f'[VAL DEBUG] rank=a{dist.get_rank()} entering teacher run_fid_validation', flush=True)
