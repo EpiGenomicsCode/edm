@@ -180,7 +180,9 @@ def run_fid_validation(
         # Inception features and running stats.
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
-        feats = detector(images.to(device), **detector_kwargs).to(torch.float64)
+        # Match fid.py expectations: detector consumes uint8 0..255 tensors.
+        images_u8 = (images * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        feats = detector(images_u8.to(device), **detector_kwargs).to(torch.float64)
         mu += feats.sum(0)
         sigma += feats.T @ feats
 
