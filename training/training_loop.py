@@ -210,6 +210,8 @@ def training_loop(
                 print(f'[VAL DEBUG] rank={dist.get_rank()} teacher_flag={int(flag_tensor.item())}', flush=True)
             except Exception:
                 pass
+            # Global sync so either all enter validation together or none do.
+            torch.distributed.barrier()
             if int(flag_tensor.item()) == 1:
                 teacher_net = loss_fn.teacher_net
                 try:

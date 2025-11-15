@@ -98,15 +98,7 @@ def run_fid_validation(
             dist.print0(f'[VAL] Skipping validation at kimg={step_kimg} because results already exist.')
             torch.distributed.barrier()
             return {}
-    try:
-        print(f'[VAL DEBUG] rank={rank} before barrier A', flush=True)
-    except Exception:
-        pass
-    torch.distributed.barrier()
-    try:
-        print(f'[VAL DEBUG] rank={rank} after barrier A', flush=True)
-    except Exception:
-        pass
+    # Note: barrier synchronization is performed before entering this function.
 
     # Ensure EMA is synchronized across ranks before validation.
     try:
