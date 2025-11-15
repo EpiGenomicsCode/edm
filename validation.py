@@ -27,8 +27,10 @@ def _load_inception_detector(device: torch.device):
     import pickle as _pickle
     
     # Rank 0 goes first.
+    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} before first barrier', flush=True)
     if dist.get_rank() != 0:
         torch.distributed.barrier()
+    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} after first barrier (or skipped if rank0)', flush=True)
     
     detector_kwargs = dict(return_features=True)
     feature_dim = 2048
@@ -40,6 +42,7 @@ def _load_inception_detector(device: torch.device):
         if os.path.isfile(repo_local):
             local_path = repo_local
     
+    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} about to load from {local_path or "URL"}', flush=True)
     if local_path is not None and os.path.isfile(local_path):
         dist.print0(f'Loading Inception-v3 model from local file "{local_path}"...')
         with open(local_path, 'rb') as f:
@@ -50,9 +53,11 @@ def _load_inception_detector(device: torch.device):
         with _dnnlib.util.open_url(detector_url, verbose=(dist.get_rank() == 0)) as f:
             detector_net = _pickle.load(f).to(device)
     
+    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} loaded detector, about to hit second barrier', flush=True)
     # Other ranks follow.
     if dist.get_rank() == 0:
         torch.distributed.barrier()
+    print(f'[VAL DEBUG INCEPTION] rank={dist.get_rank()} after second barrier (or skipped if rank0)', flush=True)
     
     return detector_net, detector_kwargs, feature_dim
 
