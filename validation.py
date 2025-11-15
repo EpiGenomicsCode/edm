@@ -139,13 +139,9 @@ def run_fid_validation(
     mu_ref, sigma_ref = _prepare_reference_stats(ref, ref_data, batch=batch, device=device, seed=seed, cache_dir=cache_dir)
     dist.print0(f'[VAL DEBUG] reference loaded; elapsed {(__import__("time").time()-t0):.1f}s')
 
-    # Inception on each rank, rank 0 goes first (mirror fid.py barrier pattern).
-    if dist.get_rank() != 0:
-        torch.distributed.barrier()
+    # Inception on each rank (_load_inception_detector has its own rank-0-first barriers).
     dist.print0('[VAL DEBUG] before inception load (rank0 will print the loader message next)')
     detector, detector_kwargs, feature_dim = _load_inception_detector(device)
-    if dist.get_rank() == 0:
-        torch.distributed.barrier()
     dist.print0(f'[VAL DEBUG] inception ready; elapsed {(__import__("time").time()-t0):.1f}s')
 
     # Seed assignment and sharding.
