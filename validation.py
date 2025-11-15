@@ -38,19 +38,15 @@ def _prepare_reference_stats(ref: Optional[str], ref_data: Optional[str], *, bat
     mu_ref = None
     sigma_ref = None
     if ref is not None:
-        # Rank 0 goes first (fid.py pattern).
-        if dist.get_rank() != 0:
-            torch.distributed.barrier()
-        
-        dist.print0(f'[VAL DEBUG] Loading ref from {ref}')
-        with dnnlib.util.open_url(ref, verbose=(dist.get_rank() == 0)) as f:
-            ref_npz = dict(np.load(f))
-            mu_ref = ref_npz['mu']
-            sigma_ref = ref_npz['sigma']
-        
-        # Other ranks follow.
+        # Match fid.py: only rank 0 loads ref; others leave it None.
+        mu_ref = None
+        sigma_ref = None
         if dist.get_rank() == 0:
-            torch.distributed.barrier()
+            dist.print0(f'[VAL DEBUG] Loading ref from \"{ref}\"...')
+            with dnnlib.util.open_url(ref) as f:
+                ref_npz = dict(np.load(f))
+                mu_ref = ref_npz['mu']
+                sigma_ref = ref_npz['sigma']
         return mu_ref, sigma_ref
     if ref_data is not None:
         # Compute dataset stats once and optionally cache.
