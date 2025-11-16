@@ -123,33 +123,6 @@ def run_fid_validation(
         pass
     net = net.eval().requires_grad_(False).to(device)
 
-    # Diagnostics: on teacher baseline (step_kimg is None), inspect net and parameters once.
-    if step_kimg is None and rank == 0:
-        try:
-            p = next(net.parameters())
-            sigma_min_attr = getattr(net, 'sigma_min', None)
-            sigma_max_attr = getattr(net, 'sigma_max', None)
-            dist.print0(
-                f'[VAL DIAG] net={type(net).__name__}, device={p.device}, dtype={p.dtype}, '
-                f'sigma_min={sigma_min_attr}, sigma_max={sigma_max_attr}'
-            )
-            # Quick NaN check on a few params.
-            has_nan = False
-            checked = 0
-            for name, param in net.named_parameters():
-                if param.is_floating_point():
-                    if torch.isnan(param).any():
-                        dist.print0(f'[VAL DIAG] net param "{name}" contains NaNs')
-                        has_nan = True
-                        break
-                checked += 1
-                if checked >= 16:
-                    break
-            if not has_nan:
-                dist.print0('[VAL DIAG] net parameter sample has no NaNs')
-        except Exception as _e:
-            dist.print0(f'[VAL DIAG] net diagnostics failed: {_e}')
-
     # Reference stats.
     cache_dir = os.path.join(run_dir, 'fid-refs')
     mu_ref, sigma_ref = _prepare_reference_stats(ref, ref_data, batch=batch, device=device, seed=seed, cache_dir=cache_dir)
@@ -216,33 +189,7 @@ def run_fid_validation(
         sampler_kwargs = {k: v for k, v in (sampler or {}).items() if v is not None and k != 'kind'}
         have_ablation = (sampler_kind == 'ablate') or any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation else edm_sampler
-
-        # Diagnostics: print sampler config once (rank 0).
-        if local_batch_idx == 1 and rank == 0:
-            dist.print0(f'[VAL DIAG] sampler_fn={sampler_fn.__name__}, sampler_kwargs={sampler_kwargs}')
         images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
-
-        # Diagnostics: check inputs/outputs for first batch.
-        if local_batch_idx == 1:
-            try:
-                print(
-                    f'[VAL DIAG] rank={rank} batch={local_batch_idx}: '
-                    f'latents range=[{float(latents.min()):.3f}, {float(latents.max()):.3f}], '
-                    f'images range=[{float(images.min()):.3f}, {float(images.max()):.3f}], '
-                    f'images mean={float(images.mean()):.3f}, '
-                    f'latents_has_nan={bool(torch.isnan(latents).any())}, '
-                    f'images_has_nan={bool(torch.isnan(images).any())}',
-                    flush=True,
-                )
-                if class_labels is not None:
-                    print(
-                        f'[VAL DIAG] rank={rank} labels shape={class_labels.shape}, '
-                        f'labels_sum={float(class_labels.sum())}, '
-                        f'labels_has_nan={bool(torch.isnan(class_labels).any())}',
-                        flush=True,
-                    )
-            except Exception:
-                pass
 
         # Optional dump images for audit.
         if dump_images_dir is not None and rank == 0:

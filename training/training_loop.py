@@ -221,13 +221,6 @@ def training_loop(
             if should_run_teacher:
                 # Use the same teacher object that the CD loss uses.
                 teacher_net = loss_fn.teacher_net.eval().requires_grad_(False).to(device)
-                # Diagnostic: check teacher state per rank.
-                try:
-                    p = next(teacher_net.parameters())
-                    print(f'[VAL DIAG] rank={dist.get_rank()} teacher device={p.device}, dtype={p.dtype}, norm={float(p.norm()):.3f}', flush=True)
-                except Exception as e:
-                    print(f'[VAL DIAG] rank={dist.get_rank()} teacher check failed: {e}', flush=True)
-
                 # Teacher sampler defaults per README ImageNet.
                 # IMPORTANT: Do NOT override sigma_min/sigma_max here — edm_sampler
                 # has good defaults (0.002, 80) and clamps against net.sigma_min/max.
@@ -239,7 +232,6 @@ def training_loop(
                     S_churn=40, S_min=0.05, S_max=50.0, S_noise=1.003,
                 )
                 dist.print0('[VAL] Running one-time teacher validation (ImageNet defaults)...')
-                # Dump a few teacher samples for sanity check.
                 teacher_dump_dir = os.path.join(run_dir, 'teacher_samples') if dist.get_rank() == 0 else None
                 result = run_fid_validation(
                     teacher_net,
