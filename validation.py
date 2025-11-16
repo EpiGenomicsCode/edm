@@ -127,9 +127,11 @@ def run_fid_validation(
     if step_kimg is None and rank == 0:
         try:
             p = next(net.parameters())
+            sigma_min_attr = getattr(net, 'sigma_min', None)
+            sigma_max_attr = getattr(net, 'sigma_max', None)
             dist.print0(
                 f'[VAL DIAG] net={type(net).__name__}, device={p.device}, dtype={p.dtype}, '
-                f'sigma_min={getattr(net, \"sigma_min\", None)}, sigma_max={getattr(net, \"sigma_max\", None)}'
+                f'sigma_min={sigma_min_attr}, sigma_max={sigma_max_attr}'
             )
             # Quick NaN check on a few params.
             has_nan = False
