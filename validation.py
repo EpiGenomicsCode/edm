@@ -189,6 +189,10 @@ def run_fid_validation(
         have_ablation = (sampler_kind == 'ablate') or any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation else edm_sampler
         images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+        
+        # Diagnostic: check sampler output range for first batch.
+        if local_batch_idx == 1:
+            print(f'[VAL DIAG] rank={rank} batch={local_batch_idx}: sampler output range=[{float(images.min()):.3f}, {float(images.max()):.3f}], mean={float(images.mean()):.3f}', flush=True)
 
         # Optional dump images for audit.
         if dump_images_dir is not None and rank == 0:
