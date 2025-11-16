@@ -229,11 +229,12 @@ def training_loop(
                     print(f'[VAL DIAG] rank={dist.get_rank()} teacher check failed: {e}', flush=True)
 
                 # Teacher sampler defaults per README ImageNet.
+                # IMPORTANT: Do NOT override sigma_min/sigma_max here — edm_sampler
+                # has good defaults (0.002, 80) and clamps against net.sigma_min/max.
+                # Passing net.sigma_min/max (=0, inf) would break the grid and cause NaNs.
                 teacher_sampler = dict(
                     kind='edm',
                     num_steps=256,
-                    sigma_min=float(getattr(teacher_net, 'sigma_min', 0.002)),
-                    sigma_max=float(getattr(teacher_net, 'sigma_max', 80.0)),
                     rho=7.0,
                     S_churn=40, S_min=0.05, S_max=50.0, S_noise=1.003,
                 )
