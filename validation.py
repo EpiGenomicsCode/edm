@@ -103,7 +103,7 @@ def run_fid_validation(
     step_kimg: Optional[int] = None,
     wandb_run: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Compute FID by generating images with the current EMA network."""
+    """Compute FID by generating images with the given network (teacher or student EMA)."""
     device = torch.device('cuda')
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -116,12 +116,37 @@ def run_fid_validation(
             torch.distributed.barrier()
             return {}
 
-    # Ensure EMA is synchronized across ranks before validation.
+    # Ensure network is synchronized across ranks before validation.
     try:
         misc.check_ddp_consistency(net)
     except Exception:
         pass
     net = net.eval().requires_grad_(False).to(device)
+
+    # Diagnostics: on teacher baseline (step_kimg is None), inspect net and parameters once.
+    if step_kimg is None and rank == 0:
+        try:
+            p = next(net.parameters())
+            dist.print0(
+                f'[VAL DIAG] net={type(net).__name__}, device={p.device}, dtype={p.dtype}, '
+                f'sigma_min={getattr(net, \"sigma_min\", None)}, sigma_max={getattr(net, \"sigma_max\", None)}'
+            )
+            # Quick NaN check on a few params.
+            has_nan = False
+            checked = 0
+            for name, param in net.named_parameters():
+                if param.is_floating_point():
+                    if torch.isnan(param).any():
+                        dist.print0(f'[VAL DIAG] net param "{name}" contains NaNs')
+                        has_nan = True
+                        break
+                checked += 1
+                if checked >= 16:
+                    break
+            if not has_nan:
+                dist.print0('[VAL DIAG] net parameter sample has no NaNs')
+        except Exception as _e:
+            dist.print0(f'[VAL DIAG] net diagnostics failed: {_e}')
 
     # Reference stats.
     cache_dir = os.path.join(run_dir, 'fid-refs')
@@ -166,6 +191,7 @@ def run_fid_validation(
         if rank == 0 and (local_batch_idx == 1 or (local_batch_idx % 10 == 0) or (local_batch_idx == non_empty_rank_batches)):
             pct = 100.0 * local_batch_idx / max(non_empty_rank_batches, 1)
             dist.print0(f'[VAL] Progress (rank0): {local_batch_idx}/{non_empty_rank_batches} ({pct:.1f}%)')
+
         # Per-sample seeds are base + index.
         seeds = (seed + b_idxs).tolist()
         rnd = StackedRandomGenerator(device, seeds)
@@ -188,11 +214,33 @@ def run_fid_validation(
         sampler_kwargs = {k: v for k, v in (sampler or {}).items() if v is not None and k != 'kind'}
         have_ablation = (sampler_kind == 'ablate') or any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation else edm_sampler
+
+        # Diagnostics: print sampler config once (rank 0).
+        if local_batch_idx == 1 and rank == 0:
+            dist.print0(f'[VAL DIAG] sampler_fn={sampler_fn.__name__}, sampler_kwargs={sampler_kwargs}')
         images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
-        
-        # Diagnostic: check sampler output range for first batch.
+
+        # Diagnostics: check inputs/outputs for first batch.
         if local_batch_idx == 1:
-            print(f'[VAL DIAG] rank={rank} batch={local_batch_idx}: sampler output range=[{float(images.min()):.3f}, {float(images.max()):.3f}], mean={float(images.mean()):.3f}', flush=True)
+            try:
+                print(
+                    f'[VAL DIAG] rank={rank} batch={local_batch_idx}: '
+                    f'latents range=[{float(latents.min()):.3f}, {float(latents.max()):.3f}], '
+                    f'images range=[{float(images.min()):.3f}, {float(images.max()):.3f}], '
+                    f'images mean={float(images.mean()):.3f}, '
+                    f'latents_has_nan={bool(torch.isnan(latents).any())}, '
+                    f'images_has_nan={bool(torch.isnan(images).any())}',
+                    flush=True,
+                )
+                if class_labels is not None:
+                    print(
+                        f'[VAL DIAG] rank={rank} labels shape={class_labels.shape}, '
+                        f'labels_sum={float(class_labels.sum())}, '
+                        f'labels_has_nan={bool(torch.isnan(class_labels).any())}',
+                        flush=True,
+                    )
+            except Exception:
+                pass
 
         # Optional dump images for audit.
         if dump_images_dir is not None and rank == 0:

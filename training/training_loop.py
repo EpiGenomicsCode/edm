@@ -219,8 +219,7 @@ def training_loop(
             # Global sync so either all enter validation together or none do.
             torch.distributed.barrier()
             if should_run_teacher:
-                # CRITICAL: Teacher was loaded on rank 0's device in train.py.
-                # Each rank needs it on their own device (cuda:rank).
+                # Use the same teacher object that the CD loss uses.
                 teacher_net = loss_fn.teacher_net.eval().requires_grad_(False).to(device)
                 # Diagnostic: check teacher state per rank.
                 try:
@@ -228,6 +227,7 @@ def training_loop(
                     print(f'[VAL DIAG] rank={dist.get_rank()} teacher device={p.device}, dtype={p.dtype}, norm={float(p.norm()):.3f}', flush=True)
                 except Exception as e:
                     print(f'[VAL DIAG] rank={dist.get_rank()} teacher check failed: {e}', flush=True)
+
                 # Teacher sampler defaults per README ImageNet.
                 teacher_sampler = dict(
                     kind='edm',
