@@ -230,6 +230,8 @@ def training_loop(
                     S_churn=40, S_min=0.05, S_max=50.0, S_noise=1.003,
                 )
                 dist.print0('[VAL] Running one-time teacher validation (ImageNet defaults)...')
+                # Dump a few teacher samples for sanity check.
+                teacher_dump_dir = os.path.join(run_dir, 'teacher_samples') if dist.get_rank() == 0 else None
                 result = run_fid_validation(
                     teacher_net,
                     run_dir=run_dir,
@@ -241,7 +243,7 @@ def training_loop(
                     labels='auto',
                     ref=validation_kwargs.get('ref', None),
                     ref_data=validation_kwargs.get('ref_data', None),
-                    dump_images_dir=None,
+                    dump_images_dir=teacher_dump_dir,
                     overwrite=False,
                     step_kimg=None,
                     wandb_run=wandb_run,

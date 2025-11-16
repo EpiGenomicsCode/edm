@@ -158,10 +158,10 @@ def run_fid_validation(
     progress = tqdm.tqdm(rank_batches_list, unit='batch', disable=(rank != 0), ascii=True, mininterval=5.0, miniters=1, dynamic_ncols=False)
     local_batch_idx = 0
     for b_idxs in progress:
-        torch.distributed.barrier()
         bsize = len(b_idxs)
         if bsize == 0:
             continue
+        torch.distributed.barrier()
         local_batch_idx += 1
         if rank == 0 and (local_batch_idx == 1 or (local_batch_idx % 10 == 0) or (local_batch_idx == non_empty_rank_batches)):
             pct = 100.0 * local_batch_idx / max(non_empty_rank_batches, 1)
@@ -205,9 +205,11 @@ def run_fid_validation(
         # Inception features and running stats.
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
-        # Match fid.py expectations: detector consumes uint8 0..255 tensors.
+        # Match fid.py: dataset returns uint8, we convert sampler float output to uint8.
+        # Sampler outputs float32 in ~[-1, 1], convert to uint8 [0, 255].
         images_u8 = (images * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        feats = detector(images_u8.to(device), **detector_kwargs).to(torch.float64)
+        # Feed to Inception exactly as fid.py does.
+        feats = detector(images_u8, **detector_kwargs).to(torch.float64)
         mu += feats.sum(0)
         sigma += feats.T @ feats
 
