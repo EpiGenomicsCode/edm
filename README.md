@@ -1,6 +1,6 @@
 ## Consistency Distillation for EDM (ImageNet-64, conditional) — In Progress
 
-This repository is now focused on implementing Multistep Consistency Distillation (MCD) in the EDM framework for ImageNet-64 with class-conditioning. The legacy EDM README has been moved to docs (`docs/README-legacy-edm.md`)
+This repository is now focused on implementing Multistep Consistency Distillation (MCD) in the EDM framework for ImageNet-64 with class-conditioning. The legacy EDM README has been moved to docs (`docs/README-legacy-edm.md`) 
 
 ### Status
 - Target: S-step deterministic student (S ∈ {4, 8, 16}) distilled from a frozen EDM teacher using Heun integration over a denser Karras sigma grid, in EDM parameterization.
