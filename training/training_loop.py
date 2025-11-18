@@ -147,7 +147,6 @@ def training_loop(
         try:
             import wandb as _wandb
             # Make W&B robust with our stdout redirection: avoid isatty uses.
-            os.environ.setdefault('WANDB_CONSOLE', 'off')
             # Provide isatty() when stdout/stderr are our custom Logger without it.
             try:
                 if not hasattr(sys.stdout, 'isatty'):
@@ -165,12 +164,13 @@ def training_loop(
             mode = wandb_kwargs.get('mode', 'online')
             if mode in ('offline', 'disabled'):
                 init_kwargs['mode'] = mode
-            # Pass settings to avoid console/tty assumptions.
+            # Use default settings so W&B can capture console logs.
+            wandb_run = _wandb.init(**init_kwargs, config=wandb_config)
+            # Also sync log.txt into the W&B run Files tab (live).
             try:
-                settings = _wandb.Settings(console='off')
-                wandb_run = _wandb.init(**init_kwargs, config=wandb_config, settings=settings)
+                _wandb.save(os.path.join(run_dir, 'log.txt'), policy='live')
             except Exception:
-                wandb_run = _wandb.init(**init_kwargs, config=wandb_config)
+                pass
         except Exception as _e:
             dist.print0(f'[W&B] init failed: {_e}')
             wandb_run = None
