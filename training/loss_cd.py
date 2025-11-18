@@ -83,21 +83,37 @@ class EDMConsistencyDistillLoss:
         self.sigma_data = float(sigma_data)
         self.enable_stats = enable_stats
 
-        # Internal counters for optional local annealing when global kimg is not available.
-        self._seen_batches = 0
-        self._approx_kimg = 0.0
+        # Global kimg for teacher annealing; set externally by training loop.
+        # Defaults to 0 if not explicitly set.
+        self._global_kimg = 0.0
+
+    def set_global_kimg(self, kimg: float) -> None:
+        """
+        Set the global training progress in kimg for annealing teacher edges.
+        The training loop is responsible for calling this once per tick with
+        the current global kimg (including resume_kimg).
+        """
+        self._global_kimg = float(kimg)
 
     def _current_T_edges(self) -> int:
         """
-        Compute current teacher edges T based on local approximate kimg, if annealing is configured.
-        This uses a per-rank approximation since training_loop does not pass global kimg.
+        Compute current teacher edges T based on global training progress.
         If T_anneal_kimg <= 0, return T_end.
+
+        Schedule: log-linear interpolation between T_start and T_end over
+        T_anneal_kimg "kimg" of training, analogous in shape to the multistep
+        paper's schedule N_teacher(i) = exp(log T_start + clip(i/H,0,1)*(log T_end-log T_start)),
+        but expressed in terms of global kimg instead of raw optimizer steps.
         """
         if self.T_anneal_kimg <= 0:
             return self.T_end
-        # Linear ramp from T_start to T_end over T_anneal_kimg (kimg).
-        ratio = min(max(self._approx_kimg / self.T_anneal_kimg, 0.0), 1.0)
-        T_now = int(round(self.T_start + (self.T_end - self.T_start) * ratio))
+        # Log-linear ramp from T_start to T_end over T_anneal_kimg (kimg),
+        # using resume-aware global training progress.
+        ratio = min(max(self._global_kimg / self.T_anneal_kimg, 0.0), 1.0)
+        log_T_start = math.log(self.T_start)
+        log_T_end = math.log(self.T_end)
+        log_T_now = log_T_start + ratio * (log_T_end - log_T_start)
+        T_now = int(round(math.exp(log_T_now)))
         T_now = max(self.T_start, min(self.T_end, T_now))
         return T_now
 
@@ -141,10 +157,6 @@ class EDMConsistencyDistillLoss:
         """
         device = images.device
         batch_size = images.shape[0]
-        # Update approximate kimg for optional annealing (local rank approximation).
-        # Assume 1 image contributes to 1/batch_size kimg per batch.
-        self._seen_batches += 1
-        self._approx_kimg += (batch_size / 1000.0)
 
         # Optional augmentation (matches other losses).
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)

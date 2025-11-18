@@ -270,6 +270,13 @@ def training_loop(
     last_loss_scalar = None
     while True:
 
+        # Make teacher annealing resume-aware by exposing global kimg to the loss.
+        try:
+            if hasattr(loss_fn, 'set_global_kimg'):
+                loss_fn.set_global_kimg(cur_nimg / 1e3)
+        except Exception:
+            pass
+
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
