@@ -42,7 +42,7 @@ def _select_segment_and_edge(segments: list, rng_device: torch.device) -> Tuple[
     return j, e
 
 
-def _huber_loss(x: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+def _huber_loss(x: torch.Tensor, delta: float = 1e-4) -> torch.Tensor:
     abs_x = x.abs()
     quad = torch.minimum(abs_x, torch.as_tensor(delta, device=x.device, dtype=x.dtype))
     # 0.5 * quad^2 + delta * (abs_x - quad)
