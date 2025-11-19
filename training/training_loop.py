@@ -206,7 +206,10 @@ def training_loop(
     
     # One-time teacher validation (baseline) using ImageNet defaults if available.
     try:
-        if (validation_kwargs is not None and validation_kwargs.get('enabled', True) and hasattr(loss_fn, 'teacher_net')):
+        if (validation_kwargs is not None
+            and validation_kwargs.get('enabled', True)
+            and validation_kwargs.get('teacher', True)
+            and hasattr(loss_fn, 'teacher_net')):
             # Rank 0 decides; broadcast to all.
             should_run_teacher = False
             if dist.get_rank() == 0:

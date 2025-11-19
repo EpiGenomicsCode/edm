@@ -114,6 +114,7 @@ def parse_int_list(s):
 @click.option('--val_dump_images_dir', help='Optional: dump validation images', metavar='DIR',       type=str)
 @click.option('--val_overwrite', help='Overwrite existing val_{kimg}.json', metavar='BOOL',          type=bool, default=False, show_default=True)
 @click.option('--val_at_start',  help='Run validation at start (tick 0)', metavar='BOOL',            type=bool, default=False, show_default=True)
+@click.option('--val_teacher',   help='Run one-time teacher baseline validation at start', metavar='BOOL', type=bool, default=True, show_default=True)
 
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
@@ -392,6 +393,7 @@ def main(**kwargs):
         dump_images_dir=opts.val_dump_images_dir,
         overwrite=opts.val_overwrite,
         at_start=opts.val_at_start,
+        teacher=opts.val_teacher,
     )
 
     # Train.
