@@ -145,50 +145,42 @@ def training_loop(
 
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    
-    # Seed student from teacher BEFORE DDP wrapping (if CD mode and shapes match).
-    # Rank 0 decides and seeds; then broadcasts to all ranks.
-    if hasattr(loss_fn, 'teacher_net'):
-        try:
-            if dist.get_rank() == 0:
-                teacher = loss_fn.teacher_net
-                # Check if all params/buffers match in shape.
-                def _shapes(mod):
-                    d = {}
-                    for n, p in mod.named_parameters():
-                        d[n] = tuple(p.shape)
-                    for n, b in mod.named_buffers():
-                        d[n] = tuple(b.shape)
-                    return d
-                t_shapes = _shapes(teacher)
-                s_shapes = _shapes(net)
-                mismatches = []
-                for name, tshape in t_shapes.items():
-                    sshape = s_shapes.get(name)
-                    if sshape is None or sshape != tshape:
-                        mismatches.append((name, tshape, sshape))
-                if len(mismatches) == 0:
-                    # All shapes match; copy weights on rank 0.
-                    misc.copy_params_and_buffers(src_module=teacher, dst_module=net, require_all=False)
-                    dist.print0('[CD INIT] Seeded student weights from teacher (all parameter/buffer shapes match).')
-                else:
-                    dist.print0(f'[CD INIT] Not seeding from teacher because {len(mismatches)} tensors differ in shape.')
-            # Broadcast student weights from rank 0 to all other ranks.
-            torch.distributed.barrier()
-            for name, tensor in misc.named_params_and_buffers(net):
-                # Detach to avoid autograd issues during broadcast.
-                tensor_detached = tensor.detach()
-                torch.distributed.broadcast(tensor=tensor_detached, src=0)
-                # Copy back to the original tensor (in-place).
-                tensor.copy_(tensor_detached)
-            torch.distributed.barrier()
-            if dist.get_rank() == 0:
-                dist.print0('[CD INIT] Broadcasted student weights to all ranks.')
-        except Exception as _e:
-            dist.print0(f'[CD INIT] Failed to seed from teacher: {_e}')
-    
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
     ema = copy.deepcopy(net).eval().requires_grad_(False)
+    
+    # Seed student from teacher AFTER DDP wrapping (if CD mode and shapes match).
+    # This avoids NCCL desync issues during DDP initialization.
+    if hasattr(loss_fn, 'teacher_net'):
+        try:
+            teacher = loss_fn.teacher_net
+            # Check if all params/buffers match in shape.
+            def _shapes(mod):
+                d = {}
+                for n, p in mod.named_parameters():
+                    d[n] = tuple(p.shape)
+                for n, b in mod.named_buffers():
+                    d[n] = tuple(b.shape)
+                return d
+            t_shapes = _shapes(teacher)
+            s_shapes = _shapes(net)
+            mismatches = []
+            for name, tshape in t_shapes.items():
+                sshape = s_shapes.get(name)
+                if sshape is None or sshape != tshape:
+                    mismatches.append((name, tshape, sshape))
+            if len(mismatches) == 0:
+                # All shapes match; copy weights to the underlying net module.
+                misc.copy_params_and_buffers(src_module=teacher, dst_module=net, require_all=False)
+                # Also update EMA to start from teacher weights.
+                misc.copy_params_and_buffers(src_module=teacher, dst_module=ema, require_all=False)
+                if dist.get_rank() == 0:
+                    dist.print0('[CD INIT] Seeded student & EMA from teacher (all parameter/buffer shapes match).')
+            else:
+                if dist.get_rank() == 0:
+                    dist.print0(f'[CD INIT] Not seeding from teacher because {len(mismatches)} tensors differ in shape.')
+        except Exception as _e:
+            if dist.get_rank() == 0:
+                dist.print0(f'[CD INIT] Failed to seed from teacher: {_e}')
 
     # Optional W&B initialization (async/threaded).
     wandb_run = None
