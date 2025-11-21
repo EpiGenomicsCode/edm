@@ -176,7 +176,11 @@ def training_loop(
             # Broadcast student weights from rank 0 to all other ranks.
             torch.distributed.barrier()
             for name, tensor in misc.named_params_and_buffers(net):
-                torch.distributed.broadcast(tensor=tensor, src=0)
+                # Detach to avoid autograd issues during broadcast.
+                tensor_detached = tensor.detach()
+                torch.distributed.broadcast(tensor=tensor_detached, src=0)
+                # Copy back to the original tensor (in-place).
+                tensor.copy_(tensor_detached)
             torch.distributed.barrier()
             if dist.get_rank() == 0:
                 dist.print0('[CD INIT] Broadcasted student weights to all ranks.')
