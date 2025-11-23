@@ -372,6 +372,9 @@ def main(**kwargs):
         c.wandb_config = None
 
     # Validation configuration (PRD-04).
+    # For the student EMA, we want a deterministic sampler (no stochastic churn),
+    # so we override S_* to disable noise. Teacher baseline in training_loop.py
+    # still uses the stochastic ImageNet defaults for its one-time FID.
     c.validation_kwargs = dnnlib.EasyDict(
         enabled=opts.val,
         every=opts.val_every or c.snapshot_ticks,
@@ -384,8 +387,8 @@ def main(**kwargs):
             sigma_min=opts.sigma_min,
             sigma_max=opts.sigma_max,
             rho=opts.rho,
-            # ImageNet defaults per README for teacher recipe; student differs only in steps.
-            S_churn=40, S_min=0.05, S_max=50.0, S_noise=1.003,
+            # Deterministic student validation: no stochastic churn noise.
+            S_churn=0.0, S_min=0.0, S_max=0.0, S_noise=1.0,
         ),
         labels=opts.val_label,
         ref=opts.val_ref,
