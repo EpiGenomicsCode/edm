@@ -373,8 +373,9 @@ def main(**kwargs):
 
     # Validation configuration (PRD-04).
     # For the student EMA, we want a deterministic sampler (no stochastic churn),
-    # so we override S_* to disable noise. Teacher baseline in training_loop.py
-    # still uses the stochastic ImageNet defaults for its one-time FID.
+    # and we prefer a pure Euler ODE solver during validation. Teacher baseline
+    # in training_loop.py still uses the stochastic ImageNet defaults for its
+    # one-time FID with the original EDM Heun sampler.
     c.validation_kwargs = dnnlib.EasyDict(
         enabled=opts.val,
         every=opts.val_every or c.snapshot_ticks,
@@ -382,11 +383,16 @@ def main(**kwargs):
         seed=opts.val_seed,
         batch=opts.val_batch,
         sampler=dict(
-            kind=opts.val_sampler,
+            # Use ablation sampler with Euler + EDM grid for student validation.
+            kind='ablate',
             num_steps=opts.val_steps,
             sigma_min=opts.sigma_min,
             sigma_max=opts.sigma_max,
             rho=opts.rho,
+            solver='euler',
+            discretization='edm',
+            schedule='linear',
+            scaling='none',
             # Deterministic student validation: no stochastic churn noise.
             S_churn=0.0, S_min=0.0, S_max=0.0, S_noise=1.0,
         ),
