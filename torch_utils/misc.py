@@ -5,12 +5,14 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
+import os
 import re
 import contextlib
 import numpy as np
 import torch
 import warnings
 import dnnlib
+from . import distributed as dist
 
 #----------------------------------------------------------------------------
 # Cached construction of constant tensors. Avoids CPU=>GPU copy when the
@@ -178,7 +180,16 @@ def ddp_sync(module, sync):
 # Check DistributedDataParallel consistency across processes.
 
 def check_ddp_consistency(module, ignore_regex=None):
+    """Check DDP parameter/buffer equality across ranks.
+
+    Can be disabled entirely by setting EDM_DDP_CHECK=0 in the environment.
+    When EDM_DDP_DEBUG_CHECK=1, logs each tensor name & numel on rank 0
+    before broadcasting, which is useful for pinpointing NCCL stalls.
+    """
+    if os.environ.get('EDM_DDP_CHECK', '1') != '1':
+        return
     assert isinstance(module, torch.nn.Module)
+    debug = os.environ.get('EDM_DDP_DEBUG_CHECK', '0') == '1'
     for name, tensor in named_params_and_buffers(module):
         fullname = type(module).__name__ + '.' + name
         if ignore_regex is not None and re.fullmatch(ignore_regex, fullname):
@@ -187,6 +198,8 @@ def check_ddp_consistency(module, ignore_regex=None):
         if tensor.is_floating_point():
             tensor = nan_to_num(tensor)
         other = tensor.clone()
+        if debug and dist.get_rank() == 0:
+            print(f'[DDP CHECK] broadcasting {fullname}, numel={other.numel()}', flush=True)
         torch.distributed.broadcast(tensor=other, src=0)
         assert (tensor == other).all(), fullname
 

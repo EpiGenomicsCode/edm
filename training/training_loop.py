@@ -242,8 +242,10 @@ def training_loop(
         run_dir_str = ''
     # Use object list broadcast.
     run_dir_list = [run_dir_str]
+    dist.ddp_debug(f'run_dir broadcast: before, run_dir_str="{run_dir_str}"')
     torch.distributed.broadcast_object_list(run_dir_list, src=0)
     run_dir = run_dir_list[0] if run_dir_list[0] else None
+    dist.ddp_debug(f'run_dir broadcast: after, run_dir="{run_dir}"')
     
     # One-time teacher validation (baseline) using ImageNet defaults if available.
     try:
@@ -258,8 +260,10 @@ def training_loop(
                 should_run_teacher = not os.path.isfile(teacher_done_flag)
             # Broadcast decision from rank 0.
             flag_tensor = torch.tensor([1 if should_run_teacher else 0], dtype=torch.int64, device=device)
+            dist.ddp_debug(f'teacher_flag broadcast: before, val={int(flag_tensor.item())}')
             torch.distributed.broadcast(flag_tensor, src=0)
             should_run_teacher = bool(flag_tensor.item())
+            dist.ddp_debug(f'teacher_flag broadcast: after, val={int(flag_tensor.item())}')
             # Global sync so either all enter validation together or none do.
             torch.distributed.barrier()
             if should_run_teacher:

@@ -254,7 +254,9 @@ def main(**kwargs):
         c.seed = opts.seed
     else:
         seed = torch.randint(1 << 31, size=[], device=torch.device('cuda'))
+        dist.ddp_debug(f'seed broadcast: before, local seed={int(seed)}')
         torch.distributed.broadcast(seed, src=0)
+        dist.ddp_debug(f'seed broadcast: after, global seed={int(seed)}')
         c.seed = int(seed)
 
     # Transfer learning and resume.

@@ -42,6 +42,13 @@ def get_world_size():
 
 #----------------------------------------------------------------------------
 
+def ddp_debug(msg: str):
+    """Rank-0-only debug print for DDP/NCCL issues, gated by EDM_DDP_DEBUG."""
+    if os.environ.get('EDM_DDP_DEBUG', '0') == '1' and get_rank() == 0:
+        print(f'[DDP DEBUG] {msg}', flush=True)
+
+#----------------------------------------------------------------------------
+
 def should_stop():
     return False
 

@@ -117,8 +117,11 @@ def run_fid_validation(
             return {}
 
     # Ensure network is synchronized across ranks before validation.
+    # Allow disabling this expensive check via EDM_DDP_CHECK=0.
     try:
-        misc.check_ddp_consistency(net)
+        import os as _os
+        if _os.environ.get('EDM_DDP_CHECK', '1') == '1':
+            misc.check_ddp_consistency(net)
     except Exception:
         pass
     net = net.eval().requires_grad_(False).to(device)
@@ -293,11 +296,15 @@ def maybe_validate(
             should_run = True
     if not should_run:
         return
-    # Broadcast a shared decision (bool -> int tensor).
+    # Broadcast a shared decision (bool -> int tensor) so that a future
+    # change in logic cannot accidentally desync ranks.
     flag = torch.tensor([1 if should_run else 0], dtype=torch.int64, device=torch.device('cuda'))
+    dist.ddp_debug(f'student_val_flag broadcast: before, tick={step_tick}, kimg={step_kimg}, val={int(flag.item())}')
     torch.distributed.broadcast(flag, src=0)
     if int(flag.item()) == 0:
+        dist.ddp_debug(f'student_val_flag broadcast: after, tick={step_tick}, kimg={step_kimg}, val=0 (skip)')
         return
+    dist.ddp_debug(f'student_val_flag broadcast: after, tick={step_tick}, kimg={step_kimg}, val=1 (run)')
     # Unpack kwargs (keep names aligned with PRD).
     sampler_cfg = validation_kwargs.get('sampler', {}) or {}
     return run_fid_validation(
