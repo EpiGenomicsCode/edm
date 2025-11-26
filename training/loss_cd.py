@@ -537,8 +537,15 @@ class EDMConsistencyDistillLoss:
         report_lines.append("## 4. Per-bin Statistics")
         report_lines.append("")
         
-        # Optional augmentation
+        # Optional augmentation (match training_loop.py semantics).
+        # Dataset yields uint8 in [0,255]; training_loop converts to float32 in [-1,1].
         y, augment_labels = augment_pipe(images_vis) if augment_pipe is not None else (images_vis, None)
+        if not torch.is_floating_point(y):
+            # Convert uint8 -> float32 in [-1, 1], consistent with training.
+            y = y.to(torch.float32) / 127.5 - 1.0
+        else:
+            # Ensure float32 for all math below.
+            y = y.to(torch.float32)
         
         for bin_idx, j, e in selected_edges:
             sigma_t_scalar = teacher_sigmas[e]
