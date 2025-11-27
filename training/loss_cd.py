@@ -224,22 +224,8 @@ class EDMConsistencyDistillLoss:
         eps = torch.randn_like(y)
         x_t = y + sigma_t * eps
 
-        # Deterministic teacher hop with Heun: x_s_teach.
-        x_s_teach = heun_hop_edm(
-            net=self.teacher_net,
-            x_t=x_t,
-            sigma_t=sigma_t_scalar,  # Pass scalar to allow rounding within the op.
-            sigma_s=sigma_s_scalar,
-            class_labels=labels,
-            augment_labels=augment_labels,
-        )
-
-        # Push to right student boundary.
-        # With Boltz sampling, sigma_bdry is guaranteed to be the right boundary of segment j.
-        # For terminal edge (sigma_s == 0), sigma_bdry == 0 as well.
+        # Check if we're at terminal edge (sigma_s == 0)
         tol = 1e-12
-        
-        # Check if we're at terminal edge
         at_terminal = torch.allclose(
             sigma_s_scalar, 
             torch.tensor(0.0, device=device, dtype=sigma_s_scalar.dtype),
@@ -248,10 +234,21 @@ class EDMConsistencyDistillLoss:
         
         if at_terminal:
             # Terminal edge: sigma_s = 0, sigma_bdry = 0
-            # Anchor to clean input for standard EDM denoising
+            # Skip teacher hop (can't evaluate at sigma=0)
+            # Anchor directly to clean input for standard EDM denoising
             x_ref_bdry = y.to(torch.float32)
         else:
-            # Interior edge: check if boundary coincides with teaching point
+            # Interior edge: run teacher hop
+            x_s_teach = heun_hop_edm(
+                net=self.teacher_net,
+                x_t=x_t,
+                sigma_t=sigma_t_scalar,
+                sigma_s=sigma_s_scalar,
+                class_labels=labels,
+                augment_labels=augment_labels,
+            )
+            
+            # Check if boundary coincides with teaching point
             equal_b_s = torch.allclose(
                 sigma_bdry_scalar, 
                 sigma_s_scalar, 
@@ -522,21 +519,8 @@ class EDMConsistencyDistillLoss:
             eps = torch.randn_like(y)
             x_t = y + sigma_t * eps
             
-            # Teacher hop
-            with torch.no_grad():
-                x_s_teach = heun_hop_edm(
-                    net=self.teacher_net,
-                    x_t=x_t,
-                    sigma_t=sigma_t_scalar,
-                    sigma_s=sigma_s_scalar,
-                    class_labels=labels_vis,
-                    augment_labels=augment_labels,
-                )
-            
-            # Boundary reference (mirror __call__ semantics).
-            tol = 1e-12
-            
             # Check if at terminal edge
+            tol = 1e-12
             at_terminal = torch.allclose(
                 sigma_s_scalar,
                 torch.tensor(0.0, device=device, dtype=sigma_s_scalar.dtype),
@@ -544,10 +528,22 @@ class EDMConsistencyDistillLoss:
             )
             
             if at_terminal:
-                # Terminal edge: anchor to clean input
+                # Terminal edge: skip teacher hop, anchor to clean input
                 x_ref_bdry = y.to(torch.float32)
+                x_s_teach = None  # Not computed for terminal edge
             else:
-                # Interior edge
+                # Interior edge: run teacher hop
+                with torch.no_grad():
+                    x_s_teach = heun_hop_edm(
+                        net=self.teacher_net,
+                        x_t=x_t,
+                        sigma_t=sigma_t_scalar,
+                        sigma_s=sigma_s_scalar,
+                        class_labels=labels_vis,
+                        augment_labels=augment_labels,
+                    )
+                
+                # Check if boundary coincides with teaching point
                 equal_b_s = torch.allclose(
                     sigma_bdry_scalar, 
                     sigma_s_scalar, 
@@ -593,7 +589,7 @@ class EDMConsistencyDistillLoss:
             # Compute RMS norms
             rms_y = rms(y)
             rms_x_t = rms(x_t)
-            rms_x_s_teach = rms(x_s_teach)
+            rms_x_s_teach = rms(x_s_teach) if x_s_teach is not None else 0.0
             rms_x_ref_bdry = rms(x_ref_bdry)
             rms_x_hat_t_star = rms(x_hat_t_star)
             rms_x_hat_t = rms(x_hat_t)
@@ -645,14 +641,26 @@ class EDMConsistencyDistillLoss:
             # Generate image grids for each sample
             for sample_idx in range(num_samples_visual):
                 # Collect tensors for this sample
-                tensors_to_vis = [
-                    y[sample_idx:sample_idx+1],
-                    x_t[sample_idx:sample_idx+1],
-                    x_s_teach[sample_idx:sample_idx+1],
-                    x_ref_bdry[sample_idx:sample_idx+1],
-                    x_hat_t_star[sample_idx:sample_idx+1],
-                    x_hat_t[sample_idx:sample_idx+1],
-                ]
+                if x_s_teach is not None:
+                    tensors_to_vis = [
+                        y[sample_idx:sample_idx+1],
+                        x_t[sample_idx:sample_idx+1],
+                        x_s_teach[sample_idx:sample_idx+1],
+                        x_ref_bdry[sample_idx:sample_idx+1],
+                        x_hat_t_star[sample_idx:sample_idx+1],
+                        x_hat_t[sample_idx:sample_idx+1],
+                    ]
+                else:
+                    # Terminal edge: no x_s_teach, show black placeholder
+                    black_placeholder = torch.zeros_like(y[sample_idx:sample_idx+1])
+                    tensors_to_vis = [
+                        y[sample_idx:sample_idx+1],
+                        x_t[sample_idx:sample_idx+1],
+                        black_placeholder,
+                        x_ref_bdry[sample_idx:sample_idx+1],
+                        x_hat_t_star[sample_idx:sample_idx+1],
+                        x_hat_t[sample_idx:sample_idx+1],
+                    ]
                 
                 # Normalize to [0, 1] for visualization
                 def normalize_for_vis(t):
