@@ -11,38 +11,11 @@ from torch_utils import training_stats
 from .consistency_ops import (
     make_karras_sigmas,
     partition_edges_into_segments,
+    sample_segment_and_teacher_pair,
     heun_hop_edm,
     inv_ddim_edm,
     ddim_step_edm,
 )
-
-
-def _select_segment_and_edge(segments: list, rng_device: torch.device) -> Tuple[int, int]:
-    """
-    Uniformly sample a segment id j and an adjacent edge index e inside that segment.
-    segments[j] = (start, end) over teacher edges, using [start, end) convention.
-    Returns (j, e) with e in [start, end-1].
-    """
-    assert len(segments) > 0
-    S = len(segments)
-    # Choose segment uniformly.
-    j = int(torch.randint(low=0, high=S, size=(1,), device=rng_device).item())
-    start, end = segments[j]
-    # Handle degenerate empty segments by resampling a non-empty one.
-    attempts = 0
-    while (end - start) <= 0 and attempts < 8:
-        j = int(torch.randint(low=0, high=S, size=(1,), device=rng_device).item())
-        start, end = segments[j]
-        attempts += 1
-    if (end - start) <= 0:
-        # Fallback: collapse to the closest valid edge index.
-        # This should be exceedingly rare unless S >> T.
-        j = 0
-        start, end = segments[j]
-    # Sample adjacent edge e within [start, end-1].
-    # If only one edge in the segment, this becomes deterministic.
-    e = int(torch.randint(low=start, high=max(start + 1, end), size=(1,), device=rng_device).item())
-    return j, e
 
 
 def _huber_loss(x: torch.Tensor, delta: float = 1e-4) -> torch.Tensor:
@@ -171,30 +144,36 @@ class EDMConsistencyDistillLoss:
         return T_now
 
     def _build_student_grid(self, net, device: torch.device) -> torch.Tensor:
-        # Student requires S+1 descending positive sigmas; conceptual 0 boundary handled separately.
+        # Student grid: S positive sigmas + terminal 0
         # net may be wrapped in DDP; grab underlying module's round_sigma if needed.
         round_fn = getattr(net, 'round_sigma', None)
         if round_fn is None and hasattr(net, 'module'):
             round_fn = getattr(net.module, 'round_sigma', None)
-        sigmas = make_karras_sigmas(
-            num_nodes=self.S + 1,
+        sigmas_prepad = make_karras_sigmas(
+            num_nodes=self.S,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
             rho=self.rho,
             round_fn=round_fn,
         ).to(device)
+        # Append terminal zero
+        zero = torch.zeros(1, device=device, dtype=sigmas_prepad.dtype)
+        sigmas = torch.cat([sigmas_prepad, zero], dim=0)
         return sigmas
 
     def _build_teacher_grid(self, device: torch.device) -> torch.Tensor:
-        # Teacher edges T => T+1 nodes.
+        # Teacher grid: T positive sigmas + terminal 0
         T_edges = self._current_T_edges()
-        sigmas = make_karras_sigmas(
-            num_nodes=T_edges + 1,
+        sigmas_prepad = make_karras_sigmas(
+            num_nodes=T_edges,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
             rho=self.rho,
             round_fn=self.teacher_net.round_sigma,
         ).to(device)
+        # Append terminal zero
+        zero = torch.zeros(1, device=device, dtype=sigmas_prepad.dtype)
+        sigmas = torch.cat([sigmas_prepad, zero], dim=0)
         return sigmas
 
     def _weight(self, sigma: torch.Tensor) -> torch.Tensor:
@@ -214,25 +193,27 @@ class EDMConsistencyDistillLoss:
         # Optional augmentation (matches other losses).
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
 
-        # Build grids.
-        student_sigmas = self._build_student_grid(net=net, device=device)  # [S+1], descending
-        teacher_sigmas = self._build_teacher_grid(device=device)           # [T+1], descending
+        # Build grids with terminal zeros.
+        student_sigmas = self._build_student_grid(net=net, device=device)  # [S+1] with terminal 0
+        teacher_sigmas = self._build_teacher_grid(device=device)           # [T+1] with terminal 0
         T_edges = teacher_sigmas.shape[0] - 1
 
         # Partition teacher edges into S segments.
-        segments = partition_edges_into_segments(T=T_edges, S=self.S)
+        boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
 
-        # Sample a segment j and an adjacent teacher edge e inside it.
-        j, e = _select_segment_and_edge(segments, rng_device=device)
-        sigma_t_scalar = teacher_sigmas[e]
-        sigma_s_scalar = teacher_sigmas[e + 1]
-
-        # Determine right student boundary for this segment.
-        # For segments j = 0..S-2, boundary is student_sigmas[j+1]; for last j=S-1, conceptual boundary is 0.
-        if j < self.S - 1:
-            sigma_bdry_scalar = student_sigmas[j + 1]
-        else:
-            sigma_bdry_scalar = torch.as_tensor(0.0, device=device, dtype=teacher_sigmas.dtype)
+        # Sample (j, k_t, k_s, sigma_t, sigma_s, sigma_bdry) - all batch_size=1, then broadcast
+        sample_dict = sample_segment_and_teacher_pair(
+            boundaries=boundaries,
+            teacher_sigmas=teacher_sigmas,
+            student_sigmas=student_sigmas,
+            batch_size=1,  # sample once per call, broadcast to all images
+            device=device,
+        )
+        
+        j = int(sample_dict["step_j"].item())
+        sigma_t_scalar = sample_dict["sigma_t"].squeeze()
+        sigma_s_scalar = sample_dict["sigma_s"].squeeze()
+        sigma_bdry_scalar = sample_dict["sigma_bdry"].squeeze()
 
         # Broadcast scalars to per-sample sigma tensors as [N,1,1,1] to match other losses.
         sigma_t = sigma_t_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
@@ -253,77 +234,41 @@ class EDMConsistencyDistillLoss:
             augment_labels=augment_labels,
         )
 
-        # Push to right student boundary at s using student/teacher, depending on segment.
-        # Use float32 math internally.
+        # Push to right student boundary.
+        # With Boltz sampling, sigma_bdry is guaranteed to be the right boundary of segment j.
+        # For terminal edge (sigma_s == 0), sigma_bdry == 0 as well.
         tol = 1e-12
-        if j == self.S - 1:
-            # Last segment: conceptual boundary at σ_bdry = 0.
-            # To avoid degenerate self-consistency at low noise and to match the EDM paper's
-            # argument that the last segment reduces to standard EDM denoising, we anchor the
-            # boundary directly to the clean/augmented input y (≈ x).
-            # With σ_ref = 0 and x_ref_bdry = y, inv-DDIM yields x_hat_t_star ≈ x and the loss
-            # becomes λ(σ_t) ρ(D_θ(x_t; σ_t) - y), i.e., standard EDM denoising.
+        
+        # Check if we're at terminal edge
+        at_terminal = torch.allclose(
+            sigma_s_scalar, 
+            torch.tensor(0.0, device=device, dtype=sigma_s_scalar.dtype),
+            atol=tol, rtol=0.0
+        )
+        
+        if at_terminal:
+            # Terminal edge: sigma_s = 0, sigma_bdry = 0
+            # Anchor to clean input for standard EDM denoising
             x_ref_bdry = y.to(torch.float32)
         else:
-            # General case: guard if σ_bdry == σ_s (within tol), otherwise push via student.
-            equal_b_s_scalar = torch.isclose(
-                sigma_bdry_scalar.to(torch.float32), sigma_s_scalar.to(torch.float32), atol=1e-12, rtol=0.0
-            ).item()
-            if equal_b_s_scalar:
-                # Take the teacher hop as the boundary directly; do not run a student Euler/DDIM step.
-                x_ref_bdry = x_s_teach.to(torch.float32)
-            else:
-                with torch.no_grad():
-                    x_hat_s_ng = net(x_s_teach, sigma_s, labels, augment_labels=augment_labels).to(torch.float32)
-                ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
-                x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
-
-        # Backsolve a target at t via inverse-DDIM in EDM space.
-        # If σ_bdry == σ_t (within tol), resample a few times or skip.
-        attempts = 0
-        while attempts < 4 and torch.isclose(sigma_bdry_scalar.to(torch.float32), sigma_t_scalar.to(torch.float32), atol=1e-12, rtol=0.0).item():
-            # Resample a new pair inside the same segment j if possible; else resample segment.
-            # Prefer changing e within the same segment.
-            start, end = segments[j]
-            if (end - start) > 1:
-                e = int(torch.randint(low=start, high=end, size=(1,), device=device).item())
-                sigma_t_scalar = teacher_sigmas[e]
-                sigma_s_scalar = teacher_sigmas[e + 1]
-            else:
-                j, e = _select_segment_and_edge(segments, rng_device=device)
-                sigma_t_scalar = teacher_sigmas[e]
-                sigma_s_scalar = teacher_sigmas[e + 1]
-                if j < self.S - 1:
-                    sigma_bdry_scalar = student_sigmas[j + 1]
-                else:
-                    sigma_bdry_scalar = torch.as_tensor(0.0, device=device, dtype=teacher_sigmas.dtype)
-            sigma_t = sigma_t_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
-            sigma_s = sigma_s_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
-            sigma_bdry = sigma_bdry_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
-            # Recompute x_t and teacher hop for new pair.
-            eps = torch.randn_like(y)
-            x_t = y + sigma_t * eps
-            x_s_teach = heun_hop_edm(
-                net=self.teacher_net,
-                x_t=x_t,
-                sigma_t=sigma_t_scalar,
-                sigma_s=sigma_s_scalar,
-                class_labels=labels,
-                augment_labels=augment_labels,
+            # Interior edge: check if boundary coincides with teaching point
+            equal_b_s = torch.allclose(
+                sigma_bdry_scalar, 
+                sigma_s_scalar, 
+                atol=tol, rtol=0.0
             )
-            equal_b_s_scalar = torch.isclose(
-                sigma_bdry_scalar.to(torch.float32), sigma_s_scalar.to(torch.float32), atol=1e-12, rtol=0.0
-            ).item()
-            if equal_b_s_scalar:
+            
+            if equal_b_s:
+                # Boundary coincides: use teacher trajectory
                 x_ref_bdry = x_s_teach.to(torch.float32)
             else:
+                # General case: push from sigma_s to sigma_bdry using student
                 with torch.no_grad():
                     x_hat_s_ng = net(x_s_teach, sigma_s, labels, augment_labels=augment_labels).to(torch.float32)
                 ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
                 x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
-            attempts += 1
 
-        # Now compute inv-DDIM target at t.
+        # Compute inv-DDIM target at t.
         x_hat_t_star = inv_ddim_edm(
             x_ref=x_ref_bdry,
             x_t=x_t,
@@ -457,13 +402,13 @@ class EDMConsistencyDistillLoss:
                     "sigma_bdry": sigma_bdry,
                 })
         
-        # Build grids
+        # Build grids with terminal zeros
         with torch.no_grad():
             student_sigmas = self._build_student_grid(net=net, device=device)
             teacher_sigmas = self._build_teacher_grid(device=device)
         
         T_edges = teacher_sigmas.shape[0] - 1
-        segments = partition_edges_into_segments(T=T_edges, S=self.S)
+        boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
         
         # === REPORT HEADER ===
         report_lines.append(f"# CD Debug Report ({step_str})")
@@ -503,13 +448,12 @@ class EDMConsistencyDistillLoss:
         # === SEGMENTS ===
         report_lines.append("## 3. Segments")
         report_lines.append("")
-        for j, (start, end) in enumerate(segments):
+        for j in range(self.S):
+            start = boundaries[j].item()
+            end = boundaries[j + 1].item()
             sigma_start = teacher_sigmas[start].item()
             sigma_end = teacher_sigmas[min(end, len(teacher_sigmas) - 1)].item()
-            if j < self.S - 1:
-                sigma_bdry_j = student_sigmas[j + 1].item()
-            else:
-                sigma_bdry_j = 0.0
+            sigma_bdry_j = student_sigmas[j + 1].item()
             report_lines.append(f"- Segment {j}:")
             report_lines.append(f"  - edges: [{start}, {end})")
             report_lines.append(f"  - sigma range: [{sigma_end:.6f}, {sigma_start:.6f}]")
@@ -517,30 +461,30 @@ class EDMConsistencyDistillLoss:
         report_lines.append("")
         
         # === SELECT NOISE BINS ===
-        # Choose representative edges across the teacher grid
+        # Choose representative edges across the teacher grid using Boltz sampling
         bin_edges_idx = torch.linspace(0, T_edges - 1, num_sigma_bins + 1).long()
-        selected_edges = []
+        selected_configs = []
         
         for k in range(num_sigma_bins):
             # Pick midpoint of this bin
             start_idx = bin_edges_idx[k].item()
             end_idx = bin_edges_idx[k + 1].item()
             mid_idx = (start_idx + end_idx) // 2
-            e = max(0, min(T_edges - 1, mid_idx))
+            k_t = max(0, min(T_edges - 1, mid_idx))
             
-            # Find corresponding segment
+            # Find corresponding segment for this k_t
             j = None
-            for seg_idx, (seg_start, seg_end) in enumerate(segments):
-                if seg_start <= e < seg_end:
+            for seg_idx in range(self.S):
+                if boundaries[seg_idx] <= k_t < boundaries[seg_idx + 1]:
                     j = seg_idx
                     break
             
             if j is None:
                 # Fallback: use last segment
                 j = self.S - 1
-                e = segments[j][0]
+                k_t = boundaries[j].item()
             
-            selected_edges.append((k, j, e))
+            selected_configs.append((k, j, k_t))
         
         # === RUN INSTRUMENTED FORWARD PASSES ===
         report_lines.append("## 4. Per-bin Statistics")
@@ -556,22 +500,18 @@ class EDMConsistencyDistillLoss:
             # Ensure float32 for all math below.
             y = y.to(torch.float32)
         
-        for bin_idx, j, e in selected_edges:
-            sigma_t_scalar = teacher_sigmas[e]
-            sigma_s_scalar = teacher_sigmas[e + 1]
-            
-            # Determine boundary
-            if j < self.S - 1:
-                sigma_bdry_scalar = student_sigmas[j + 1]
-            else:
-                sigma_bdry_scalar = torch.as_tensor(0.0, device=device, dtype=teacher_sigmas.dtype)
+        for bin_idx, j, k_t in selected_configs:
+            k_s = k_t + 1
+            sigma_t_scalar = teacher_sigmas[k_t]
+            sigma_s_scalar = teacher_sigmas[k_s]
+            sigma_bdry_scalar = student_sigmas[j + 1]  # Right boundary of segment j
             
             sigma_t_val = float(sigma_t_scalar.cpu())
             sigma_s_val = float(sigma_s_scalar.cpu())
             sigma_bdry_val = float(sigma_bdry_scalar.cpu())
             
             # Check sigma ordering
-            check_sigma_ordering(sigma_t_val, sigma_s_val, sigma_bdry_val, j, e)
+            check_sigma_ordering(sigma_t_val, sigma_s_val, sigma_bdry_val, j, k_t)
             
             # Broadcast sigmas
             sigma_t = sigma_t_scalar.reshape(1, 1, 1, 1).repeat(num_samples_visual, 1, 1, 1)
@@ -595,16 +535,25 @@ class EDMConsistencyDistillLoss:
             
             # Boundary reference (mirror __call__ semantics).
             tol = 1e-12
-            if j == self.S - 1:
-                # Last segment: anchor boundary directly to clean/augmented input y.
+            
+            # Check if at terminal edge
+            at_terminal = torch.allclose(
+                sigma_s_scalar,
+                torch.tensor(0.0, device=device, dtype=sigma_s_scalar.dtype),
+                atol=tol, rtol=0.0
+            )
+            
+            if at_terminal:
+                # Terminal edge: anchor to clean input
                 x_ref_bdry = y.to(torch.float32)
             else:
-                equal_b_s_scalar = torch.isclose(
-                    sigma_bdry_scalar.to(torch.float32), 
-                    sigma_s_scalar.to(torch.float32), 
-                    atol=1e-12, rtol=0.0
-                ).item()
-                if equal_b_s_scalar:
+                # Interior edge
+                equal_b_s = torch.allclose(
+                    sigma_bdry_scalar, 
+                    sigma_s_scalar, 
+                    atol=tol, rtol=0.0
+                )
+                if equal_b_s:
                     x_ref_bdry = x_s_teach.to(torch.float32)
                 else:
                     with torch.no_grad():
@@ -656,7 +605,8 @@ class EDMConsistencyDistillLoss:
             bin_stats.append({
                 "bin": bin_idx,
                 "j": j,
-                "e": e,
+                "k_t": k_t,
+                "k_s": k_s,
                 "sigma_t": sigma_t_val,
                 "sigma_s": sigma_s_val,
                 "sigma_bdry": sigma_bdry_val,
@@ -675,7 +625,7 @@ class EDMConsistencyDistillLoss:
             sigma_range_desc = "high" if bin_idx == 0 else ("low" if bin_idx == num_sigma_bins - 1 else "mid")
             report_lines.append(f"### Bin {bin_idx} ({sigma_range_desc} noise)")
             report_lines.append(f"- Edge range: [{bin_edges_idx[bin_idx]}, {bin_edges_idx[bin_idx+1]})")
-            report_lines.append(f"- Representative edge e: {e}")
+            report_lines.append(f"- Representative teacher edge k_t: {k_t}, k_s: {k_s}")
             report_lines.append(f"- Segment j: {j}")
             report_lines.append(f"- sigma_t: {sigma_t_val:.6f}")
             report_lines.append(f"- sigma_s: {sigma_s_val:.6f}")
@@ -749,15 +699,12 @@ class EDMConsistencyDistillLoss:
             
             # Run one forward pass with teacher as student (use mid bin)
             mid_bin_idx = num_sigma_bins // 2
-            _, j_mid, e_mid = selected_edges[mid_bin_idx]
+            _, j_mid, k_t_mid = selected_configs[mid_bin_idx]
             
-            sigma_t_scalar = teacher_sigmas[e_mid]
-            sigma_s_scalar = teacher_sigmas[e_mid + 1]
-            
-            if j_mid < self.S - 1:
-                sigma_bdry_scalar = student_sigmas[j_mid + 1]
-            else:
-                sigma_bdry_scalar = torch.as_tensor(0.0, device=device, dtype=teacher_sigmas.dtype)
+            k_s_mid = k_t_mid + 1
+            sigma_t_scalar = teacher_sigmas[k_t_mid]
+            sigma_s_scalar = teacher_sigmas[k_s_mid]
+            sigma_bdry_scalar = student_sigmas[j_mid + 1]
             
             sigma_t = sigma_t_scalar.reshape(1, 1, 1, 1).repeat(num_samples_visual, 1, 1, 1)
             sigma_s = sigma_s_scalar.reshape(1, 1, 1, 1).repeat(num_samples_visual, 1, 1, 1)
@@ -776,18 +723,27 @@ class EDMConsistencyDistillLoss:
                     augment_labels=augment_labels,
                 )
                 
-                equal_b_s_scalar = torch.isclose(
-                    sigma_bdry_scalar.to(torch.float32), 
-                    sigma_s_scalar.to(torch.float32), 
+                # Check if at terminal edge
+                at_terminal = torch.allclose(
+                    sigma_s_scalar,
+                    torch.tensor(0.0, device=device, dtype=sigma_s_scalar.dtype),
                     atol=1e-12, rtol=0.0
-                ).item()
+                )
                 
-                if equal_b_s_scalar:
-                    x_ref_bdry = x_s_teach.to(torch.float32)
+                if at_terminal:
+                    x_ref_bdry = y.to(torch.float32)
                 else:
-                    x_hat_s_ng = student_clone(x_s_teach, sigma_s, labels_vis, augment_labels=augment_labels).to(torch.float32)
-                    ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=1e-12)).to(torch.float32)
-                    x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
+                    equal_b_s = torch.allclose(
+                        sigma_bdry_scalar, 
+                        sigma_s_scalar, 
+                        atol=1e-12, rtol=0.0
+                    )
+                    if equal_b_s:
+                        x_ref_bdry = x_s_teach.to(torch.float32)
+                    else:
+                        x_hat_s_ng = student_clone(x_s_teach, sigma_s, labels_vis, augment_labels=augment_labels).to(torch.float32)
+                        ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=1e-12)).to(torch.float32)
+                        x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
                 
                 x_hat_t_star = inv_ddim_edm(
                     x_ref=x_ref_bdry,
@@ -827,7 +783,7 @@ class EDMConsistencyDistillLoss:
         report_lines.append("6. x_hat_t (student prediction at t)")
         report_lines.append("")
         
-        for bin_idx, _, _ in selected_edges:
+        for bin_idx, _, _ in selected_configs:
             sigma_range_desc = "high" if bin_idx == 0 else ("low" if bin_idx == num_sigma_bins - 1 else "mid")
             report_lines.append(f"### Bin {bin_idx} ({sigma_range_desc} noise)")
             for sample_idx in range(num_samples_visual):

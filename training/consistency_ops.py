@@ -1,5 +1,5 @@
 import math
-from typing import Callable, List, Tuple
+from typing import Callable, Dict
 
 import torch
 
@@ -34,27 +34,126 @@ def make_karras_sigmas(
     return sigmas
 
 
-def partition_edges_into_segments(T: int, S: int) -> List[Tuple[int, int]]:
+def partition_edges_into_segments(T: int, S: int) -> torch.Tensor:
     """
-    Partition T teacher edges (indices 0..T-1) into S contiguous [start, end) ranges using:
-        k_b(j) = floor(j*T/S + 1/2), for j in {0..S}
-    Returns a list of S tuples (start_inclusive, end_exclusive).
+    Student-anchored segment boundaries for consistency distillation.
+    
+    Returns boundaries[j] = round(j * T / S) with ties going up,
+    for j in {0, ..., S}, as a LongTensor of shape (S+1,).
+    
+    Guarantees:
+    - boundaries[0] = 0
+    - boundaries[S] = T
+    - boundaries strictly increasing
+    - all segments non-empty
+    
+    Each segment j spans teacher edges [boundaries[j], boundaries[j+1]).
     """
     assert T >= 1 and S >= 1, "T and S must be >= 1"
-    bounds = []
-    for j in range(S + 1):
-        kb = int(math.floor(j * T / S + 0.5))
-        # Clamp to [0, T] to avoid any floating corner cases.
-        kb = max(0, min(T, kb))
-        bounds.append(kb)
-    segments: List[Tuple[int, int]] = []
-    for j in range(S):
-        start = bounds[j]
-        end = bounds[j + 1]
-        start = max(0, min(T, start))
-        end = max(0, min(T, end))
-        segments.append((start, end))
-    return segments
+    assert S <= T, f"S ({S}) must be <= T ({T})"
+    
+    # Nearest-int with ties up: floor(x + 0.5)
+    j = torch.arange(0, S + 1, dtype=torch.float64)
+    kb = torch.floor(j * float(T) / float(S) + 0.5).to(torch.long)
+    
+    # Guards
+    kb[0] = 0
+    kb[-1] = T
+    
+    # Validate strictly increasing
+    if not torch.all(kb[1:] > kb[:-1]):
+        raise AssertionError("boundaries must be strictly increasing")
+    
+    # Validate non-empty segments
+    seg_len = kb[1:] - kb[:-1]
+    if not torch.all(seg_len >= 1):
+        raise AssertionError("all segments must be non-empty")
+    
+    if int(seg_len.sum().item()) != T:
+        raise AssertionError("sum of segment lengths must equal T")
+    
+    return kb
+
+
+def sample_segment_and_teacher_pair(
+    boundaries: torch.Tensor,
+    teacher_sigmas: torch.Tensor,
+    student_sigmas: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    generator: torch.Generator = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Sample (j, k_t, k_s) for consistency distillation following Boltz approach.
+    
+    Args:
+        boundaries: LongTensor of shape (S+1,) from partition_edges_into_segments
+        teacher_sigmas: FloatTensor of shape (T+1,) with terminal 0
+        student_sigmas: FloatTensor of shape (S+1,) with terminal 0
+        batch_size: number of samples
+        device: torch device
+        generator: optional RNG
+    
+    Returns:
+        Dict with:
+            step_j: segment indices [batch_size]
+            k_t, k_s: teacher edge indices [batch_size]
+            sigma_t, sigma_s, sigma_bdry: noise levels [batch_size]
+    
+    Guarantees:
+        - k_t in [boundaries[j], boundaries[j+1])
+        - k_s = k_t + 1
+        - sigma_bdry = student_sigmas[j+1] (right boundary of segment j)
+        - For interior edges: sigma_t > sigma_s > sigma_bdry (strict ordering)
+        - For terminal edge (k_s == T): sigma_s = 0, sigma_bdry = 0
+    """
+    S = len(boundaries) - 1
+    T = len(teacher_sigmas) - 1
+    
+    boundaries = boundaries.to(device)
+    
+    # Sample segment j uniformly from {0, ..., S-1}
+    step_j = torch.randint(
+        low=0,
+        high=S,
+        size=(batch_size,),
+        device=device,
+        dtype=torch.long,
+        generator=generator,
+    )
+    
+    # Get segment lengths
+    seg_len = boundaries[1:] - boundaries[:-1]  # shape (S,)
+    seg_len_j = seg_len[step_j]  # shape (batch_size,)
+    
+    # Sample relative index n_rel in {1, ..., seg_len[j]} uniformly per segment
+    u = torch.empty(batch_size, device=device, dtype=torch.float32)
+    if generator is not None:
+        u.uniform_(0.0, 1.0, generator=generator)
+    else:
+        u.uniform_(0.0, 1.0)
+    
+    n_rel = torch.floor(u * seg_len_j.float() + 1.0).to(torch.long)
+    n_rel = torch.clamp(n_rel, min=1)
+    n_rel = torch.minimum(n_rel, seg_len_j)
+    
+    # Compute teacher-adjacent indices
+    k_t = boundaries[step_j] + (n_rel - 1)
+    k_s = k_t + 1
+    
+    # Gather sigmas
+    sigma_t = teacher_sigmas[k_t]
+    sigma_s = teacher_sigmas[k_s]
+    sigma_bdry = student_sigmas[step_j + 1]
+    
+    return {
+        "step_j": step_j,
+        "k_t": k_t,
+        "k_s": k_s,
+        "sigma_t": sigma_t,
+        "sigma_s": sigma_s,
+        "sigma_bdry": sigma_bdry,
+    }
 
 
 def _expand_sigma_to_bchw(sigma: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
