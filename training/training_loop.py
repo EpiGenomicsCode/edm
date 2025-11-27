@@ -375,6 +375,16 @@ def training_loop(
                             log_dict['cd_T_edges'] = int(loss_fn._current_T_edges())
                     except Exception:
                         pass
+                    # CD edge statistics (non-reset read for W&B)
+                    try:
+                        if hasattr(loss_fn, 'get_edge_stats'):
+                            edge_stats = loss_fn.get_edge_stats(reset=False)
+                            if edge_stats['total_calls'] > 0:
+                                log_dict['cd_edge/terminal_pct'] = edge_stats['terminal_pct']
+                                log_dict['cd_edge/boundary_match_pct'] = edge_stats['boundary_match_pct']
+                                log_dict['cd_edge/total_calls'] = edge_stats['total_calls']
+                    except Exception:
+                        pass
                     # Merge detailed training stats.
                     stats_payload = training_stats.default_collector.as_dict()
                     if isinstance(stats_payload, dict):
@@ -385,6 +395,18 @@ def training_loop(
                     dist.print0(f'[W&B] log failed: {_e}')
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
+        # Print CD edge statistics before validation (if CD mode).
+        try:
+            if hasattr(loss_fn, 'get_edge_stats'):
+                stats = loss_fn.get_edge_stats(reset=True)
+                if stats['total_calls'] > 0:
+                    dist.print0(f"[CD STATS] Calls since last report: {stats['total_calls']}")
+                    dist.print0(f"[CD STATS]   Terminal edges (σ_s=0): {stats['terminal_edges']} ({stats['terminal_pct']:.2f}%)")
+                    dist.print0(f"[CD STATS]   Boundary match (σ_s=σ_bdry): {stats['boundary_match']} ({stats['boundary_match_pct']:.2f}%)")
+                    dist.print0(f"[CD STATS]   General interior: {stats['general_edges']}")
+        except Exception as _e:
+            dist.print0(f'[CD STATS] failed: {_e}')
+        
         # Built-in validation hook (runs on schedule; blocks training).
         try:
             cur_kimg = cur_nimg // 1000

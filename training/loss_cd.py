@@ -112,6 +112,12 @@ class EDMConsistencyDistillLoss:
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
         self._global_kimg = 0.0
+        
+        # Diagnostic counters for edge type distribution
+        self._count_terminal_edges = 0      # sigma_s == 0
+        self._count_boundary_match = 0      # sigma_s == sigma_bdry (interior)
+        self._count_general_edges = 0       # general interior edges
+        self._count_total_calls = 0         # total __call__ invocations
 
     def set_global_kimg(self, kimg: float) -> None:
         """
@@ -120,6 +126,40 @@ class EDMConsistencyDistillLoss:
         the current global kimg (including resume_kimg).
         """
         self._global_kimg = float(kimg)
+    
+    def get_edge_stats(self, reset: bool = True) -> dict:
+        """
+        Get diagnostic statistics about edge type distribution.
+        
+        Returns:
+            dict with:
+                - total_calls: total number of __call__ invocations
+                - terminal_edges: count of terminal edges (sigma_s == 0)
+                - boundary_match: count of interior edges where sigma_s == sigma_bdry
+                - general_edges: count of general interior edges
+                - terminal_pct: percentage of terminal edges
+                - boundary_match_pct: percentage of boundary matches
+        
+        Args:
+            reset: if True, reset counters after reading
+        """
+        total = max(self._count_total_calls, 1)  # avoid division by zero
+        stats = {
+            'total_calls': self._count_total_calls,
+            'terminal_edges': self._count_terminal_edges,
+            'boundary_match': self._count_boundary_match,
+            'general_edges': self._count_general_edges,
+            'terminal_pct': 100.0 * self._count_terminal_edges / total,
+            'boundary_match_pct': 100.0 * self._count_boundary_match / total,
+        }
+        
+        if reset:
+            self._count_terminal_edges = 0
+            self._count_boundary_match = 0
+            self._count_general_edges = 0
+            self._count_total_calls = 0
+        
+        return stats
 
     def _current_T_edges(self) -> int:
         """
@@ -232,21 +272,27 @@ class EDMConsistencyDistillLoss:
             atol=tol, rtol=0.0
         )
         
+        # Update counters
+        self._count_total_calls += 1
+        if at_terminal:
+            self._count_terminal_edges += 1
+        
         if at_terminal:
             # Terminal edge: sigma_s = 0, sigma_bdry = 0
             # Skip teacher hop (can't evaluate at sigma=0)
             # Anchor directly to clean input for standard EDM denoising
             x_ref_bdry = y.to(torch.float32)
         else:
-            # Interior edge: run teacher hop
-            x_s_teach = heun_hop_edm(
-                net=self.teacher_net,
-                x_t=x_t,
-                sigma_t=sigma_t_scalar,
-                sigma_s=sigma_s_scalar,
-                class_labels=labels,
-                augment_labels=augment_labels,
-            )
+            with torch.no_grad():
+                # Interior edge: run teacher hop
+                x_s_teach = heun_hop_edm(
+                    net=self.teacher_net,
+                    x_t=x_t,
+                    sigma_t=sigma_t_scalar,
+                    sigma_s=sigma_s_scalar,
+                    class_labels=labels,
+                    augment_labels=augment_labels,
+                )
             
             # Check if boundary coincides with teaching point
             equal_b_s = torch.allclose(
@@ -257,9 +303,11 @@ class EDMConsistencyDistillLoss:
             
             if equal_b_s:
                 # Boundary coincides: use teacher trajectory
+                self._count_boundary_match += 1
                 x_ref_bdry = x_s_teach.to(torch.float32)
             else:
                 # General case: push from sigma_s to sigma_bdry using student
+                self._count_general_edges += 1
                 with torch.no_grad():
                     x_hat_s_ng = net(x_s_teach, sigma_s, labels, augment_labels=augment_labels).to(torch.float32)
                 ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
