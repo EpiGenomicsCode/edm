@@ -253,21 +253,30 @@ class EDMConsistencyDistillLoss:
             augment_labels=augment_labels,
         )
 
-        # Push to right student boundary at s using student net at σ_s with stopgrad prediction.
-        # Guard: if σ_bdry == σ_s (within tol), set x_ref_bdry = x_s_teach.
+        # Push to right student boundary at s using student/teacher, depending on segment.
         # Use float32 math internally.
         tol = 1e-12
-        equal_b_s_scalar = torch.isclose(
-            sigma_bdry_scalar.to(torch.float32), sigma_s_scalar.to(torch.float32), atol=1e-12, rtol=0.0
-        ).item()
-        if equal_b_s_scalar:
-            # Take the teacher hop as the boundary directly; do not run a student Euler/DDIM step.
-            x_ref_bdry = x_s_teach.to(torch.float32)
+        if j == self.S - 1:
+            # Last segment: conceptual boundary at σ_bdry = 0.
+            # To avoid degenerate self-consistency at low noise and to match the EDM paper's
+            # argument that the last segment reduces to standard EDM denoising, we anchor the
+            # boundary directly to the clean/augmented input y (≈ x).
+            # With σ_ref = 0 and x_ref_bdry = y, inv-DDIM yields x_hat_t_star ≈ x and the loss
+            # becomes λ(σ_t) ρ(D_θ(x_t; σ_t) - y), i.e., standard EDM denoising.
+            x_ref_bdry = y.to(torch.float32)
         else:
-            with torch.no_grad():
-                x_hat_s_ng = net(x_s_teach, sigma_s, labels, augment_labels=augment_labels).to(torch.float32)
-            ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
-            x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
+            # General case: guard if σ_bdry == σ_s (within tol), otherwise push via student.
+            equal_b_s_scalar = torch.isclose(
+                sigma_bdry_scalar.to(torch.float32), sigma_s_scalar.to(torch.float32), atol=1e-12, rtol=0.0
+            ).item()
+            if equal_b_s_scalar:
+                # Take the teacher hop as the boundary directly; do not run a student Euler/DDIM step.
+                x_ref_bdry = x_s_teach.to(torch.float32)
+            else:
+                with torch.no_grad():
+                    x_hat_s_ng = net(x_s_teach, sigma_s, labels, augment_labels=augment_labels).to(torch.float32)
+                ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
+                x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
 
         # Backsolve a target at t via inverse-DDIM in EDM space.
         # If σ_bdry == σ_t (within tol), resample a few times or skip.
@@ -584,21 +593,24 @@ class EDMConsistencyDistillLoss:
                     augment_labels=augment_labels,
                 )
             
-            # Boundary reference
+            # Boundary reference (mirror __call__ semantics).
             tol = 1e-12
-            equal_b_s_scalar = torch.isclose(
-                sigma_bdry_scalar.to(torch.float32), 
-                sigma_s_scalar.to(torch.float32), 
-                atol=1e-12, rtol=0.0
-            ).item()
-            
-            if equal_b_s_scalar:
-                x_ref_bdry = x_s_teach.to(torch.float32)
+            if j == self.S - 1:
+                # Last segment: anchor boundary directly to clean/augmented input y.
+                x_ref_bdry = y.to(torch.float32)
             else:
-                with torch.no_grad():
-                    x_hat_s_ng = net(x_s_teach, sigma_s, labels_vis, augment_labels=augment_labels).to(torch.float32)
-                ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
-                x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
+                equal_b_s_scalar = torch.isclose(
+                    sigma_bdry_scalar.to(torch.float32), 
+                    sigma_s_scalar.to(torch.float32), 
+                    atol=1e-12, rtol=0.0
+                ).item()
+                if equal_b_s_scalar:
+                    x_ref_bdry = x_s_teach.to(torch.float32)
+                else:
+                    with torch.no_grad():
+                        x_hat_s_ng = net(x_s_teach, sigma_s, labels_vis, augment_labels=augment_labels).to(torch.float32)
+                    ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
+                    x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
             
             # Inverse DDIM target
             x_hat_t_star = inv_ddim_edm(
