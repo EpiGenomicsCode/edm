@@ -427,51 +427,6 @@ def training_loop(
         except Exception as _e:
             dist.print0(f'[VAL] validation failed: {_e}')
 
-        # Optional: run CD debug harness on a single mini-batch using current student.
-        # This is controlled by train.py options:
-        #   --cd_debug_every (ticks, 0=off)
-        #   --cd_debug_samples
-        #   --cd_debug_bins
-        try:
-            cd_debug_every = 0
-            if validation_kwargs is not None:
-                cd_debug_every = int(validation_kwargs.get('cd_debug_every', 0) or 0)
-            if cd_debug_every > 0 and hasattr(loss_fn, 'debug_batch'):
-                # Only trigger on schedule.
-                if cur_tick % cd_debug_every == 0:
-                    # Advance dataset iterator on all ranks to keep them in sync.
-                    images_dbg, labels_dbg = next(dataset_iterator)
-                    images_dbg = images_dbg.to(device).to(torch.float32) / 127.5 - 1
-                    labels_dbg = labels_dbg.to(device)
-
-                    # Only rank 0 runs the heavy debug harness & I/O.
-                    if dist.get_rank() == 0:
-                        num_samples = int(validation_kwargs.get('cd_debug_num_samples', 4) or 4)
-                        num_bins = int(validation_kwargs.get('cd_debug_num_bins', 3) or 3)
-
-                        # Hierarchical output directory: run_dir/cd_debug/kimg_XXXXXX
-                        debug_root = os.path.join(run_dir, 'cd_debug') if run_dir is not None else 'cd_debug'
-                        step_kimg = int(cur_kimg)
-                        debug_dir = os.path.join(debug_root, f'kimg_{step_kimg:06d}')
-
-                        dist.print0(f'[CD DEBUG] Running debug harness at tick={cur_tick}, kimg={step_kimg} into "{debug_dir}"')
-                        try:
-                            loss_fn.debug_batch(
-                                net=ddp,  # current student (per-rank DDP)
-                                images=images_dbg,
-                                labels=labels_dbg,
-                                augment_pipe=augment_pipe,
-                                output_dir=debug_dir,
-                                num_samples_visual=num_samples,
-                                num_sigma_bins=num_bins,
-                                run_teacher_self_test=True,
-                                global_step=step_kimg,
-                            )
-                        except Exception as _e:
-                            dist.print0(f'[CD DEBUG] debug_batch failed: {_e}')
-        except Exception as _e:
-            dist.print0(f'[CD DEBUG] debug hook failed: {_e}')
-
         # Update state.
         cur_tick += 1
         tick_start_nimg = cur_nimg

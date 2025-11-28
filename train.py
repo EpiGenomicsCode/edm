@@ -116,11 +116,6 @@ def parse_int_list(s):
 @click.option('--val_at_start',  help='Run validation at start (tick 0)', metavar='BOOL',            type=bool, default=False, show_default=True)
 @click.option('--val_teacher',   help='Run one-time teacher baseline validation at start', metavar='BOOL', type=bool, default=True, show_default=True)
 
-# CD debug harness integration.
-@click.option('--cd_debug_every', help='Run CD debug harness every N ticks (0=off)', metavar='TICKS', type=click.IntRange(min=0), default=0, show_default=True)
-@click.option('--cd_debug_samples', help='Number of samples to visualize in CD debug', metavar='INT', type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--cd_debug_bins', help='Number of sigma bins for CD debug (low/mid/high=3)', metavar='INT', type=click.IntRange(min=1), default=3, show_default=True)
-
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
     paper "Elucidating the Design Space of Diffusion-Based Generative Models".
@@ -411,10 +406,6 @@ def main(**kwargs):
         at_start=opts.val_at_start,
         teacher=opts.val_teacher,
     )
-    # CD debug harness configuration (optional, no-op when cd_debug_every=0).
-    c.validation_kwargs.cd_debug_every = opts.cd_debug_every
-    c.validation_kwargs.cd_debug_num_samples = opts.cd_debug_samples
-    c.validation_kwargs.cd_debug_num_bins = opts.cd_debug_bins
 
     # Train.
     # Remove non-API keys before invoking training loop.
