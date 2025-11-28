@@ -84,8 +84,8 @@ def sample_segment_and_teacher_pair(
     generator: torch.Generator = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Sample (j, k_t, k_s) for consistency distillation following Boltz approach.
-    
+    Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
+
     Args:
         boundaries: LongTensor of shape (S+1,) from partition_edges_into_segments
         teacher_sigmas: FloatTensor of shape (T+1,) with terminal 0
@@ -93,19 +93,20 @@ def sample_segment_and_teacher_pair(
         batch_size: number of samples
         device: torch device
         generator: optional RNG
-    
+
     Returns:
         Dict with:
             step_j: segment indices [batch_size]
             k_t, k_s: teacher edge indices [batch_size]
             sigma_t, sigma_s, sigma_bdry: noise levels [batch_size]
-    
-    Guarantees:
-        - k_t in [boundaries[j], boundaries[j+1])
-        - k_s = k_t + 1
-        - sigma_bdry = student_sigmas[j+1] (right boundary of segment j)
-        - For interior edges: sigma_t > sigma_s > sigma_bdry (strict ordering)
-        - For terminal edge (k_s == T): sigma_s = 0, sigma_bdry = 0
+            n_rel: relative index inside segment [batch_size]
+            is_terminal: bool mask [batch_size]
+            is_boundary_snap: bool mask [batch_size]
+
+    MSCD-style semantics:
+        - terminal: k_s == T (σ_s = 0)
+        - boundary_snap: first edge in segment (n_rel == 1), not last segment, not terminal
+        - general interior: all other edges
     """
     S = len(boundaries) - 1
     T = len(teacher_sigmas) - 1
@@ -140,12 +141,18 @@ def sample_segment_and_teacher_pair(
     # Compute teacher-adjacent indices
     k_t = boundaries[step_j] + (n_rel - 1)
     k_s = k_t + 1
-    
+
     # Gather sigmas
     sigma_t = teacher_sigmas[k_t]
     sigma_s = teacher_sigmas[k_s]
     sigma_bdry = student_sigmas[step_j + 1]
-    
+
+    # Classification flags
+    S = len(boundaries) - 1
+    T = len(teacher_sigmas) - 1
+    is_terminal = (k_s == T)  # σ_s = 0
+    is_boundary_snap = (n_rel == 1) & (step_j < (S - 1)) & (~is_terminal)
+
     return {
         "step_j": step_j,
         "k_t": k_t,
@@ -153,6 +160,9 @@ def sample_segment_and_teacher_pair(
         "sigma_t": sigma_t,
         "sigma_s": sigma_s,
         "sigma_bdry": sigma_bdry,
+        "n_rel": n_rel,
+        "is_terminal": is_terminal,
+        "is_boundary_snap": is_boundary_snap,
     }
 
 

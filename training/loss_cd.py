@@ -241,19 +241,32 @@ class EDMConsistencyDistillLoss:
         # Partition teacher edges into S segments.
         boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
 
-        # Sample (j, k_t, k_s, sigma_t, sigma_s, sigma_bdry) - all batch_size=1, then broadcast
+        # Sample (j, k_t, k_s, sigma_t, sigma_s, sigma_bdry, flags) once per call, then broadcast.
         sample_dict = sample_segment_and_teacher_pair(
             boundaries=boundaries,
             teacher_sigmas=teacher_sigmas,
             student_sigmas=student_sigmas,
-            batch_size=1,  # sample once per call, broadcast to all images
+            batch_size=1,
             device=device,
         )
         
         j = int(sample_dict["step_j"].item())
         sigma_t_scalar = sample_dict["sigma_t"].squeeze()
-        sigma_s_scalar = sample_dict["sigma_s"].squeeze()
+        sigma_s_scalar_teacher = sample_dict["sigma_s"].squeeze()
         sigma_bdry_scalar = sample_dict["sigma_bdry"].squeeze()
+        is_terminal = bool(sample_dict["is_terminal"].item())
+        is_boundary_snap = bool(sample_dict["is_boundary_snap"].item())
+
+        # Choose effective teacher-hop sigma_s according to MSCD-style rule:
+        # - terminal: use σ_s = 0 (handled separately)
+        # - boundary snap (n_rel == 1, non-terminal): σ_s := σ_bdry(j)
+        # - general interior: σ_s := max(σ_s_teacher, σ_bdry(j))
+        if is_terminal:
+            sigma_s_scalar = sigma_s_scalar_teacher  # should already be 0
+        elif is_boundary_snap:
+            sigma_s_scalar = sigma_bdry_scalar
+        else:
+            sigma_s_scalar = torch.maximum(sigma_s_scalar_teacher, sigma_bdry_scalar)
 
         # Broadcast scalars to per-sample sigma tensors as [N,1,1,1] to match other losses.
         sigma_t = sigma_t_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
@@ -264,24 +277,23 @@ class EDMConsistencyDistillLoss:
         eps = torch.randn_like(y)
         x_t = y + sigma_t * eps
 
-        # Check if we're at terminal edge (sigma_s == 0)
-        tol = 1e-12
-        at_terminal = torch.allclose(
-            sigma_s_scalar, 
-            torch.tensor(0.0, device=device, dtype=sigma_s_scalar.dtype),
-            atol=tol, rtol=0.0
-        )
-        
-        # Update counters
+        # Update counters using MSCD-style classification.
         self._count_total_calls += 1
-        if at_terminal:
+        if is_terminal:
             self._count_terminal_edges += 1
-        
-        if at_terminal:
+        elif is_boundary_snap:
+            self._count_boundary_match += 1
+        else:
+            self._count_general_edges += 1
+
+        # Handle terminal edge: σ_s = 0, σ_bdry = 0.
+        tol = 1e-12
+        if is_terminal:
             # Terminal edge: sigma_s = 0, sigma_bdry = 0
             # Skip teacher hop (can't evaluate at sigma=0)
             # Anchor directly to clean input for standard EDM denoising
             x_ref_bdry = y.to(torch.float32)
+            sigma_ref_scalar = torch.as_tensor(0.0, device=device, dtype=sigma_t_scalar.dtype)
         else:
             with torch.no_grad():
                 # Interior edge: run teacher hop
@@ -294,31 +306,26 @@ class EDMConsistencyDistillLoss:
                     augment_labels=augment_labels,
                 )
             
-            # Check if boundary coincides with teaching point
-            equal_b_s = torch.allclose(
-                sigma_bdry_scalar, 
-                sigma_s_scalar, 
-                atol=tol, rtol=0.0
-            )
-            
-            if equal_b_s:
-                # Boundary coincides: use teacher trajectory
-                self._count_boundary_match += 1
+            if is_boundary_snap:
+                # Boundary snap: treat as degenerate MSCD-style teacher step.
+                # Do not push with student; anchor directly to teacher hop at σ_s.
                 x_ref_bdry = x_s_teach.to(torch.float32)
+                sigma_ref_scalar = sigma_s_scalar
             else:
-                # General case: push from sigma_s to sigma_bdry using student
-                self._count_general_edges += 1
+                # General interior: push from σ_s to σ_bdry using student.
                 with torch.no_grad():
                     x_hat_s_ng = net(x_s_teach, sigma_s, labels, augment_labels=augment_labels).to(torch.float32)
                 ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
                 x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
+                sigma_ref_scalar = sigma_bdry_scalar
 
-        # Compute inv-DDIM target at t.
+        # Compute inv-DDIM target at t using appropriate reference sigma.
+        sigma_ref = sigma_ref_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
         x_hat_t_star = inv_ddim_edm(
             x_ref=x_ref_bdry,
             x_t=x_t,
             sigma_t=sigma_t,
-            sigma_ref=sigma_bdry,
+            sigma_ref=sigma_ref,
         ).to(torch.float32)
 
         # Student prediction at t.

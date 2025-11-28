@@ -395,19 +395,20 @@ def training_loop(
                     dist.print0(f'[W&B] log failed: {_e}')
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
-        # Print CD edge statistics before validation (if CD mode, on validation schedule only).
+        # Print cumulative CD edge statistics before validation (if CD mode, on validation schedule only).
         try:
             if hasattr(loss_fn, 'get_edge_stats') and validation_kwargs is not None:
                 # Mirror validation schedule: every = validation_kwargs['every']
                 every = int(validation_kwargs.get('every', 0) or 0)
                 should_report = (every > 0 and (cur_tick % every == 0)) or every == 0
                 if should_report:
-                    stats = loss_fn.get_edge_stats(reset=True)
+                    # Do NOT reset here: we want cumulative stats since start.
+                    stats = loss_fn.get_edge_stats(reset=False)
                     if stats['total_calls'] > 0:
-                        dist.print0(f"[CD STATS] Calls since last report: {stats['total_calls']}")
-                        dist.print0(f"[CD STATS]   Terminal edges (σ_s=0): {stats['terminal_edges']} ({stats['terminal_pct']:.2f}%)")
-                        dist.print0(f"[CD STATS]   Boundary match (σ_s=σ_bdry): {stats['boundary_match']} ({stats['boundary_match_pct']:.2f}%)")
-                        dist.print0(f"[CD STATS]   General interior: {stats['general_edges']}")
+                        dist.print0(f"[CD STATS CUM] Calls so far: {stats['total_calls']}")
+                        dist.print0(f"[CD STATS CUM]   Terminal edges (σ_s=0): {stats['terminal_edges']} ({stats['terminal_pct']:.2f}%)")
+                        dist.print0(f"[CD STATS CUM]   Boundary match (σ_s=σ_bdry): {stats['boundary_match']} ({stats['boundary_match_pct']:.2f}%)")
+                        dist.print0(f"[CD STATS CUM]   General interior: {stats['general_edges']}")
         except Exception as _e:
             dist.print0(f'[CD STATS] failed: {_e}')
         
