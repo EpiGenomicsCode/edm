@@ -553,11 +553,13 @@ def run_training_debug(
     print(f"   Dataset: {len(dataset)} images, resolution={dataset.resolution}")
     
     sampler = misc.InfiniteSampler(dataset=dataset, rank=0, num_replicas=1, seed=0)
+    # Match training_loop semantics as closely as possible, but keep things
+    # robust: single-process DataLoader avoids fragile multi-process ZIP I/O.
     loader = iter(torch.utils.data.DataLoader(
         dataset=dataset,
         sampler=sampler,
         batch_size=batch_size,
-        num_workers=2,
+        num_workers=0,      # single-process for stability with ZIP datasets
         pin_memory=True,
     ))
     
