@@ -288,7 +288,6 @@ class EDMConsistencyDistillLoss:
         )
 
         # Broadcast per-sample sigmas to [N,1,1,1] for BCHW operations (PRD §4.2.3).
-        # NOTE (HPC bugfix 2025-11-29, GH200 cluster):
         #   - sigma_t_vec / sigma_s_eff / sigma_bdry_vec come from Karras grids and are float64 by default.
         #   - y is float32 (images converted to float32 in training_loop).
         #   - If we leave sigmas as float64, x_t = y + sigma_t * eps becomes float64 and
