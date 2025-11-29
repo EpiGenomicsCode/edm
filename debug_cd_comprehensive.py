@@ -344,6 +344,19 @@ def run_trajectory_debug(
     print(f"\n4. Loading dataset")
     dataset = dnnlib.util.construct_class_by_name(**dataset_kwargs)
     print(f"   Dataset: {len(dataset)} images, resolution={dataset.resolution}")
+
+    # For conditional models, build a simple DataLoader to obtain properly
+    # formatted class labels (one-hot or float vectors) that match training.
+    # We only need labels, not images, but reusing the dataset logic ensures
+    # shapes/dtypes are consistent with how the teacher & student were trained.
+    labels_loader = None
+    if use_labels:
+        labels_loader = iter(torch.utils.data.DataLoader(
+            dataset,
+            batch_size=num_samples_per_seed,
+            shuffle=True,
+            num_workers=0,
+        ))
     
     # Create report
     report_path = os.path.join(outdir, 'trajectory_report.md')
@@ -368,14 +381,26 @@ def run_trajectory_debug(
         seed = seed_idx * 1000  # Space out seeds
         print(f"\n   Seed {seed}...")
         
-        # Get labels if needed
+        # Get labels if needed (match training semantics)
         labels = None
         if use_labels:
-            # Sample random labels
-            num_classes = dataset.label_dim if hasattr(dataset, 'label_dim') else 1000
-            labels = torch.randint(0, num_classes, (num_samples_per_seed,), device=device)
+            # Draw a small batch from the dataset to obtain labels with the
+            # correct shape [N, label_dim] and dtype (typically float32 one-hot).
+            try:
+                images_batch, labels_batch = next(labels_loader)
+            except StopIteration:
+                # Recreate iterator if exhausted.
+                labels_loader = iter(torch.utils.data.DataLoader(
+                    dataset,
+                    batch_size=num_samples_per_seed,
+                    shuffle=True,
+                    num_workers=0,
+                ))
+                images_batch, labels_batch = next(labels_loader)
+
+            labels = labels_batch.to(device=device, dtype=torch.float32)
         
-        # Sample trajectories
+        # Sample trajectories (teacher & student see the same labels/noise)
         xs_teacher = sample_teacher_trajectory(
             teacher_net, student_sigmas, seed, labels, device, use_heun=True
         )
