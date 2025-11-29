@@ -287,10 +287,20 @@ class EDMConsistencyDistillLoss:
             sigma_s_eff,
         )
 
-        # Broadcast per-sample sigmas to [N,1,1,1] for BCHW operations (PRD §4.2.3)
-        sigma_t = sigma_t_vec.view(batch_size, 1, 1, 1)
-        sigma_s = sigma_s_eff.view(batch_size, 1, 1, 1)
-        sigma_bdry = sigma_bdry_vec.view(batch_size, 1, 1, 1)
+        # Broadcast per-sample sigmas to [N,1,1,1] for BCHW operations (PRD §4.2.3).
+        # NOTE (HPC bugfix 2025-11-29, GH200 cluster):
+        #   - sigma_t_vec / sigma_s_eff / sigma_bdry_vec come from Karras grids and are float64 by default.
+        #   - y is float32 (images converted to float32 in training_loop).
+        #   - If we leave sigmas as float64, x_t = y + sigma_t * eps becomes float64 and
+        #     x_ref_bdry (zeros_like(x_t)) is also float64, while y[...] is float32.
+        #   - On the NCSA GH200 nodes this caused:
+        #         RuntimeError: Index put requires the source and destination dtypes match,
+        #         got Double for the destination and Float for the source.
+        #   - We fix this by explicitly casting sigmas to y.dtype before broadcasting so that
+        #     x_t and all downstream tensors stay in float32.
+        sigma_t = sigma_t_vec.to(y.dtype).view(batch_size, 1, 1, 1)
+        sigma_s = sigma_s_eff.to(y.dtype).view(batch_size, 1, 1, 1)
+        sigma_bdry = sigma_bdry_vec.to(y.dtype).view(batch_size, 1, 1, 1)
 
         # Optional runtime invariant checks (PRD §5, R7)
         if self.debug_invariants:
