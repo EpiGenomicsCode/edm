@@ -85,21 +85,25 @@ def sample_segment_and_teacher_pair(
 ) -> Dict[str, torch.Tensor]:
     """
     Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
+    
+    **Per-sample edge sampling**: Each element in the batch independently draws its own
+    edge (j, k_t, k_s) and corresponding sigmas. All returned tensors have shape [batch_size]
+    with independent draws per element (no replication).
 
     Args:
         boundaries: LongTensor of shape (S+1,) from partition_edges_into_segments
         teacher_sigmas: FloatTensor of shape (T+1,) with terminal 0
         student_sigmas: FloatTensor of shape (S+1,) with terminal 0
-        batch_size: number of samples
+        batch_size: number of samples (each gets an independent edge)
         device: torch device
         generator: optional RNG
 
     Returns:
         Dict with:
             step_j: segment indices [batch_size]
+            n_rel: relative edge index within segment [batch_size]
             k_t, k_s: teacher edge indices [batch_size]
             sigma_t, sigma_s, sigma_bdry: noise levels [batch_size]
-            n_rel: relative index inside segment [batch_size]
             is_terminal: bool mask [batch_size]
             is_boundary_snap: bool mask [batch_size]
 
@@ -107,6 +111,9 @@ def sample_segment_and_teacher_pair(
         - terminal: k_s == T (σ_s = 0)
         - boundary_snap: first edge in segment (n_rel == 1), not last segment, not terminal
         - general interior: all other edges
+    
+    Note: Changing batch_size from 1 to N alters RNG consumption (N independent draws per call
+    vs 1 draw per call), which affects reproducibility vs legacy single-edge-per-batch behavior.
     """
     S = len(boundaries) - 1
     T = len(teacher_sigmas) - 1

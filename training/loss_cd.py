@@ -91,6 +91,7 @@ class EDMConsistencyDistillLoss:
         weight_mode: str = "edm",    # "edm" | "vlike"
         sigma_data: float = 0.5,
         enable_stats: bool = True,
+        debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
@@ -108,16 +109,18 @@ class EDMConsistencyDistillLoss:
         self.weight_mode = weight_mode
         self.sigma_data = float(sigma_data)
         self.enable_stats = enable_stats
+        self.debug_invariants = debug_invariants
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
         self._global_kimg = 0.0
         
-        # Diagnostic counters for edge type distribution
-        self._count_terminal_edges = 0      # sigma_s == 0
-        self._count_boundary_match = 0      # sigma_s == sigma_bdry (interior)
-        self._count_general_edges = 0       # general interior edges
-        self._count_total_calls = 0         # total __call__ invocations
+        # Diagnostic counters for edge type distribution (per-sample)
+        self._count_terminal_edges = 0      # total terminal edges sampled (per-sample)
+        self._count_boundary_match = 0      # total boundary-snap edges sampled (per-sample)
+        self._count_general_edges = 0       # total general interior edges sampled (per-sample)
+        self._count_total_calls = 0         # total __call__ invocations (unchanged semantics)
+        self._count_total_edges = 0         # NEW: total sampled edges across all calls (≈ batch_size × calls)
 
     def set_global_kimg(self, kimg: float) -> None:
         """
@@ -133,24 +136,26 @@ class EDMConsistencyDistillLoss:
         
         Returns:
             dict with:
-                - total_calls: total number of __call__ invocations
+                - total_calls: total number of __call__ invocations (unchanged semantics)
+                - total_edges: NEW: total sampled edges across all calls (≈ batch_size × calls)
                 - terminal_edges: count of terminal edges (sigma_s == 0)
                 - boundary_match: count of interior edges where sigma_s == sigma_bdry
                 - general_edges: count of general interior edges
-                - terminal_pct: percentage of terminal edges
-                - boundary_match_pct: percentage of boundary matches
+                - terminal_pct: percentage of terminal edges (over total_edges)
+                - boundary_match_pct: percentage of boundary matches (over total_edges)
         
         Args:
             reset: if True, reset counters after reading
         """
-        total = max(self._count_total_calls, 1)  # avoid division by zero
+        total_edges = max(self._count_total_edges, 1)  # avoid division by zero
         stats = {
             'total_calls': self._count_total_calls,
+            'total_edges': self._count_total_edges,
             'terminal_edges': self._count_terminal_edges,
             'boundary_match': self._count_boundary_match,
             'general_edges': self._count_general_edges,
-            'terminal_pct': 100.0 * self._count_terminal_edges / total,
-            'boundary_match_pct': 100.0 * self._count_boundary_match / total,
+            'terminal_pct': 100.0 * self._count_terminal_edges / total_edges,
+            'boundary_match_pct': 100.0 * self._count_boundary_match / total_edges,
         }
         
         if reset:
@@ -158,6 +163,7 @@ class EDMConsistencyDistillLoss:
             self._count_boundary_match = 0
             self._count_general_edges = 0
             self._count_total_calls = 0
+            self._count_total_edges = 0
         
         return stats
 
@@ -241,98 +247,132 @@ class EDMConsistencyDistillLoss:
         # Partition teacher edges into S segments.
         boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
 
-        # Sample (j, k_t, k_s, sigma_t, sigma_s, sigma_bdry, flags) once per call, then broadcast.
+        # Sample per-sample edges: each element in batch gets independent (j, k_t, k_s, sigmas).
         sample_dict = sample_segment_and_teacher_pair(
             boundaries=boundaries,
             teacher_sigmas=teacher_sigmas,
             student_sigmas=student_sigmas,
-            batch_size=1,
+            batch_size=batch_size,         # per-sample sampling (PRD §4.2.1)
             device=device,
         )
         
-        j = int(sample_dict["step_j"].item())
-        sigma_t_scalar = sample_dict["sigma_t"].squeeze()
-        sigma_s_scalar_teacher = sample_dict["sigma_s"].squeeze()
-        sigma_bdry_scalar = sample_dict["sigma_bdry"].squeeze()
-        is_terminal = bool(sample_dict["is_terminal"].item())
-        is_boundary_snap = bool(sample_dict["is_boundary_snap"].item())
+        # Extract per-sample vectors (all shape [N])
+        j = sample_dict["step_j"].long()               # [N]
+        n_rel = sample_dict["n_rel"].long()            # [N]
+        sigma_t_vec = sample_dict["sigma_t"]           # [N]
+        sigma_s_teacher_vec = sample_dict["sigma_s"]   # [N]
+        sigma_bdry_vec = sample_dict["sigma_bdry"]     # [N]
+        is_terminal = sample_dict["is_terminal"].bool()        # [N]
+        is_boundary_snap = sample_dict["is_boundary_snap"].bool()  # [N]
 
-        # Choose effective teacher-hop sigma_s according to MSCD-style rule:
-        # - terminal: use σ_s = 0 (handled separately)
-        # - boundary snap (n_rel == 1, non-terminal): σ_s := σ_bdry(j)
-        # - general interior: σ_s := max(σ_s_teacher, σ_bdry(j))
-        if is_terminal:
-            sigma_s_scalar = sigma_s_scalar_teacher  # should already be 0
-        elif is_boundary_snap:
-            sigma_s_scalar = sigma_bdry_scalar
-        else:
-            sigma_s_scalar = torch.maximum(sigma_s_scalar_teacher, sigma_bdry_scalar)
+        # Vectorized MSCD sigma_s refinement (PRD §4.2.2)
+        # Apply per-element MSCD rules:
+        # - Terminal: keep sigma_s_eff = sigma_s_teacher_vec (already 0)
+        # - Boundary snap: sigma_s_eff = sigma_bdry_vec
+        # - General interior: sigma_s_eff = max(sigma_s_teacher_vec, sigma_bdry_vec)
+        sigma_s_eff = sigma_s_teacher_vec.clone()
+        
+        # Boundary snap override
+        sigma_s_eff = torch.where(
+            is_boundary_snap,
+            sigma_bdry_vec,
+            sigma_s_eff,
+        )
+        
+        # General interior: max(sigma_s_teacher, sigma_bdry)
+        is_general = (~is_terminal) & (~is_boundary_snap)
+        sigma_s_eff = torch.where(
+            is_general,
+            torch.maximum(sigma_s_teacher_vec, sigma_bdry_vec),
+            sigma_s_eff,
+        )
 
-        # Broadcast scalars to per-sample sigma tensors as [N,1,1,1] to match other losses.
-        sigma_t = sigma_t_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
-        sigma_s = sigma_s_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
-        sigma_bdry = sigma_bdry_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
+        # Broadcast per-sample sigmas to [N,1,1,1] for BCHW operations (PRD §4.2.3)
+        sigma_t = sigma_t_vec.view(batch_size, 1, 1, 1)
+        sigma_s = sigma_s_eff.view(batch_size, 1, 1, 1)
+        sigma_bdry = sigma_bdry_vec.view(batch_size, 1, 1, 1)
 
-        # Sample noise and form x_t = y + sigma_t * eps.
+        # Optional runtime invariant checks (PRD §5, R7)
+        if self.debug_invariants:
+            # Ordering invariants
+            assert (sigma_t_vec >= sigma_s_eff - 1e-8).all(), "Ordering: sigma_t >= sigma_s_eff violated"
+            assert (sigma_s_eff >= sigma_bdry_vec - 1e-8).all(), "Ordering: sigma_s_eff >= sigma_bdry violated"
+            assert (sigma_s_eff[is_terminal] == 0).all(), "Terminal edges must have sigma_s_eff == 0"
+            
+            # Edge-type mask disjointness
+            assert (is_terminal & is_boundary_snap).sum() == 0, "Terminal and boundary_snap must be disjoint"
+            
+            # Sampler-specific invariants
+            assert (n_rel[is_boundary_snap] == 1).all(), "Boundary snap edges must have n_rel == 1"
+
+        # Sample noise and form x_t = y + sigma_t * eps (PRD §4.2.4)
         eps = torch.randn_like(y)
         x_t = y + sigma_t * eps
 
-        # Update counters using MSCD-style classification.
-        self._count_total_calls += 1
-        if is_terminal:
-            self._count_terminal_edges += 1
-        elif is_boundary_snap:
-            self._count_boundary_match += 1
-        else:
-            self._count_general_edges += 1
-
-        # Handle terminal edge: σ_s = 0, σ_bdry = 0.
+        # Mixed terminal/non-terminal teacher hop logic (PRD §4.2.5)
+        # Define per-sample masks
+        non_terminal = ~is_terminal          # [N]
+        boundary_mask = is_boundary_snap     # [N]
+        general_mask = (~is_terminal) & (~is_boundary_snap)  # [N]
+        
+        # Allocate containers
+        x_s_teach = torch.zeros_like(x_t)          # [N, C, H, W]
+        x_ref_bdry = torch.zeros_like(x_t)         # [N, C, H, W]
+        sigma_ref_vec = torch.zeros_like(sigma_t_vec)  # [N]
         tol = 1e-12
-        if is_terminal:
-            # Terminal edge: sigma_s = 0, sigma_bdry = 0
-            # Skip teacher hop (can't evaluate at sigma=0)
-            # Anchor directly to clean input for standard EDM denoising
-            x_ref_bdry = y.to(torch.float32)
-            sigma_ref_scalar = torch.as_tensor(0.0, device=device, dtype=sigma_t_scalar.dtype)
-        else:
+        
+        # Teacher hop only for non-terminal samples
+        if non_terminal.any():
+            idx = non_terminal
             with torch.no_grad():
-                # Interior edge: run teacher hop
-                x_s_teach = heun_hop_edm(
+                x_s_teach_nt = heun_hop_edm(
                     net=self.teacher_net,
-                    x_t=x_t,
-                    sigma_t=sigma_t_scalar,
-                    sigma_s=sigma_s_scalar,
-                    class_labels=labels,
-                    augment_labels=augment_labels,
+                    x_t=x_t[idx],
+                    sigma_t=sigma_t_vec[idx],     # [N_nt]
+                    sigma_s=sigma_s_eff[idx],     # [N_nt], all > 0 here
+                    class_labels=labels[idx] if labels is not None else None,
+                    augment_labels=augment_labels[idx] if augment_labels is not None else None,
                 )
+            x_s_teach[idx] = x_s_teach_nt
+        
+        # Terminal edges: anchor to clean input, σ_ref = 0
+        x_ref_bdry[is_terminal] = y[is_terminal].to(torch.float32)
+        sigma_ref_vec[is_terminal] = 0.0
+        
+        # Boundary snap edges: reference is teacher hop, σ_ref = σ_s_eff
+        x_ref_bdry[boundary_mask] = x_s_teach[boundary_mask].to(torch.float32)
+        sigma_ref_vec[boundary_mask] = sigma_s_eff[boundary_mask]
+        
+        # General interior edges: push from σ_s to σ_bdry using student
+        if general_mask.any():
+            idx_g = general_mask
+            with torch.no_grad():
+                x_hat_s_ng = net(
+                    x_s_teach[idx_g],
+                    sigma_s[idx_g],              # [N_g,1,1,1]
+                    labels[idx_g] if labels is not None else None,
+                    augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                ).to(torch.float32)
             
-            if is_boundary_snap:
-                # Boundary snap: treat as degenerate MSCD-style teacher step.
-                # Do not push with student; anchor directly to teacher hop at σ_s.
-                x_ref_bdry = x_s_teach.to(torch.float32)
-                sigma_ref_scalar = sigma_s_scalar
-            else:
-                # General interior: push from σ_s to σ_bdry using student.
-                with torch.no_grad():
-                    x_hat_s_ng = net(x_s_teach, sigma_s, labels, augment_labels=augment_labels).to(torch.float32)
-                ratio_s_b = (sigma_bdry / torch.clamp(sigma_s, min=tol)).to(torch.float32)
-                x_ref_bdry = x_hat_s_ng + ratio_s_b * (x_s_teach.to(torch.float32) - x_hat_s_ng)
-                sigma_ref_scalar = sigma_bdry_scalar
+            ratio_s_b = (sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)).to(torch.float32)
+            x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
+            sigma_ref_vec[idx_g] = sigma_bdry_vec[idx_g]
 
-        # Compute inv-DDIM target at t using appropriate reference sigma.
-        sigma_ref = sigma_ref_scalar.reshape(1, 1, 1, 1).repeat(batch_size, 1, 1, 1)
+        # Compute inv-DDIM target at t using per-sample sigma_ref (PRD §4.2.6)
         x_hat_t_star = inv_ddim_edm(
             x_ref=x_ref_bdry,
             x_t=x_t,
-            sigma_t=sigma_t,
-            sigma_ref=sigma_ref,
+            sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
+            sigma_ref=sigma_ref_vec,  # [N]
         ).to(torch.float32)
 
-        # Student prediction at t.
+        # Student prediction at t (PRD §4.2.7)
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
 
-        # Weighting and loss.
-        weight = self._weight(sigma_t.to(torch.float32))
+        # Weighting and loss
+        # _weight expects 1D sigma vector [N]
+        weight = self._weight(sigma_t_vec.to(torch.float32))  # [N]
+        weight = weight.view(batch_size, 1, 1, 1)              # [N,1,1,1] for broadcast
         diff = x_hat_t - x_hat_t_star
         if self.loss_type == "huber":
             per_elem = _huber_loss(diff)
@@ -340,14 +380,30 @@ class EDMConsistencyDistillLoss:
             per_elem = diff * diff
         loss = weight * per_elem
 
-        # Optional stats.
+        # Update edge statistics (per-sample counts) (PRD §4.2.8)
+        num_terminal = int(is_terminal.sum().item())
+        num_boundary = int(is_boundary_snap.sum().item())
+        num_general = int((~is_terminal & ~is_boundary_snap).sum().item())
+        num_edges = num_terminal + num_boundary + num_general  # should equal batch_size
+        
+        # Optional debug check: mask coverage
+        if self.debug_invariants:
+            assert num_edges == batch_size, f"Edge counts don't sum to batch_size: {num_edges} != {batch_size}"
+        
+        self._count_total_calls += 1                  # preserve "# of calls" semantics
+        self._count_total_edges += num_edges          # new: "# of edges"
+        self._count_terminal_edges += num_terminal
+        self._count_boundary_match += num_boundary
+        self._count_general_edges += num_general
+
+        # Training stats reporting: batch means (PRD §4.2.9)
         if self.enable_stats:
             with torch.no_grad():
                 training_stats.report('Loss/cd', loss)
-                training_stats.report('CD/sigma_t', sigma_t_scalar)
-                training_stats.report('CD/sigma_s', sigma_s_scalar)
-                training_stats.report('CD/sigma_bdry', sigma_bdry_scalar)
-                training_stats.report('CD/seg_id', torch.as_tensor(float(j), device=device))
+                training_stats.report('CD/sigma_t', sigma_t_vec.mean())
+                training_stats.report('CD/sigma_s', sigma_s_eff.mean())
+                training_stats.report('CD/sigma_bdry', sigma_bdry_vec.mean())
+                training_stats.report('CD/seg_id', j.float().mean())
                 training_stats.report('CD/T_edges', torch.as_tensor(float(T_edges), device=device))
 
         return loss

@@ -361,10 +361,11 @@ def training_loop(
                     try:
                         if hasattr(loss_fn, 'get_edge_stats'):
                             edge_stats = loss_fn.get_edge_stats(reset=False)
-                            if edge_stats['total_calls'] > 0:
+                            if edge_stats.get('total_edges', 0) > 0:
                                 log_dict['cd_edge/terminal_pct'] = edge_stats['terminal_pct']
                                 log_dict['cd_edge/boundary_match_pct'] = edge_stats['boundary_match_pct']
-                                log_dict['cd_edge/total_calls'] = edge_stats['total_calls']
+                                log_dict['cd_edge/total_calls'] = edge_stats['total_calls']  # calls (unchanged semantics)
+                                log_dict['cd_edge/total_edges'] = edge_stats['total_edges']  # NEW: sampled edges
                     except Exception:
                         pass
                     # Merge detailed training stats.
@@ -376,6 +377,9 @@ def training_loop(
                 except Exception as _e:
                     dist.print0(f'[W&B] log failed: {_e}')
         dist.update_progress(cur_nimg // 1000, total_kimg)
+        
+        # Synchronize all ranks after rank-0-only logging to prevent desync before collective ops.
+        torch.distributed.barrier()
 
         # Print cumulative CD edge statistics before validation (if CD mode, on validation schedule only).
         try:
@@ -386,8 +390,8 @@ def training_loop(
                 if should_report:
                     # Do NOT reset here: we want cumulative stats since start.
                     stats = loss_fn.get_edge_stats(reset=False)
-                    if stats['total_calls'] > 0:
-                        dist.print0(f"[CD STATS CUM] Calls so far: {stats['total_calls']}")
+                    if stats.get('total_edges', 0) > 0:
+                        dist.print0(f"[CD STATS CUM] Calls so far: {stats['total_calls']} (sampled edges: {stats['total_edges']})")
                         dist.print0(f"[CD STATS CUM]   Terminal edges (σ_s=0): {stats['terminal_edges']} ({stats['terminal_pct']:.2f}%)")
                         dist.print0(f"[CD STATS CUM]   Boundary match (σ_s=σ_bdry): {stats['boundary_match']} ({stats['boundary_match_pct']:.2f}%)")
                         dist.print0(f"[CD STATS CUM]   General interior: {stats['general_edges']}")
