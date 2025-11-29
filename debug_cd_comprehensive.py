@@ -39,7 +39,52 @@ from training.consistency_ops import (
     ddim_step_edm,
     inv_ddim_edm,
 )
-from torch_utils import misc
+from torch_utils import misc, persistence
+
+
+# ============================================================================
+# PERSISTENCE IMPORT HOOKS (ROBUST CHECKPOINT LOADING)
+# ============================================================================
+
+@persistence.import_hook
+def _fix_relative_imports(meta: dnnlib.EasyDict) -> dnnlib.EasyDict:
+    """
+    Make pickled modules robust to relative imports by rewriting them to
+    absolute imports that match the current codebase.
+
+    This avoids `ImportError: attempted relative import with no known parent
+    package` when reconstructing persistent objects from training snapshots.
+    """
+    src = meta.module_src
+
+    # training.loss_cd: relative import -> absolute
+    src = src.replace(
+        "from .consistency_ops import (",
+        "from training.consistency_ops import (",
+    )
+
+    # torch_utils.*: relative imports -> absolute
+    src = src.replace(
+        "from . import distributed as dist",
+        "from torch_utils import distributed as dist",
+    )
+    src = src.replace(
+        "from . import training_stats",
+        "from torch_utils import training_stats",
+    )
+    src = src.replace(
+        "from . import misc",
+        "from torch_utils import misc",
+    )
+
+    # dnnlib.__init__: relative import -> absolute
+    src = src.replace(
+        "from .util import EasyDict, make_cache_dir_path",
+        "from dnnlib.util import EasyDict, make_cache_dir_path",
+    )
+
+    meta.module_src = src
+    return meta
 
 
 # ============================================================================
