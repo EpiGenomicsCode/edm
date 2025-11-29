@@ -262,6 +262,11 @@ def run_trajectory_debug(
     print("TRAJECTORY DEBUGGING")
     print("="*80)
     
+    # Import training modules to support relative imports in checkpoints
+    import training.networks
+    import training.loss
+    import training.loss_cd
+    
     # Load networks
     print(f"\n1. Loading teacher from: {teacher_pkl}")
     with dnnlib.util.open_url(teacher_pkl, verbose=True) as f:
@@ -435,6 +440,11 @@ def run_training_debug(
     print("TRAINING DEBUGGING")
     print("="*80)
     
+    # Import training modules to support relative imports in checkpoints
+    import training.networks
+    import training.loss
+    import training.loss_cd
+    
     # Load networks
     print(f"\n1. Loading teacher from: {teacher_pkl}")
     with dnnlib.util.open_url(teacher_pkl, verbose=True) as f:
@@ -588,6 +598,11 @@ def run_enhanced_batch_debug(
     print("="*80)
     print("ENHANCED BATCH DEBUGGING (with Conditioning Analysis)")
     print("="*80)
+    
+    # Import training modules to support relative imports in checkpoints
+    import training.networks
+    import training.loss
+    import training.loss_cd
     
     # Load networks
     print(f"\n1. Loading teacher from: {teacher_pkl}")
