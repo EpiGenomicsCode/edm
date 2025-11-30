@@ -88,7 +88,7 @@ class EDMConsistencyDistillLoss:
         sigma_min: float = 2e-3,
         sigma_max: float = 80.0,
         loss_type: str = "huber",    # "huber" | "l2"
-        weight_mode: str = "edm",    # "edm" | "vlike"
+        weight_mode: str = "edm",    # "edm" | "vlike" | "flat"
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
@@ -96,7 +96,7 @@ class EDMConsistencyDistillLoss:
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
         assert loss_type in ("huber", "l2")
-        assert weight_mode in ("edm", "vlike")
+        assert weight_mode in ("edm", "vlike", "flat")
         self.teacher_net = teacher_net.eval().requires_grad_(False)
         self.S = int(S)
         self.T_start = int(T_start)
@@ -225,9 +225,14 @@ class EDMConsistencyDistillLoss:
     def _weight(self, sigma: torch.Tensor) -> torch.Tensor:
         # sigma expected shape [N,1,1,1]
         if self.weight_mode == "edm":
+            # EDM-style weighting (inverse SNR^2), matches original teacher training.
             return (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
-        # v-like: 1/σ^2 + 1
-        return (1.0 / (sigma ** 2)) + 1.0
+        if self.weight_mode == "vlike":
+            # v-prediction-like weighting: 1/σ^2 + 1
+            return (1.0 / (sigma ** 2)) + 1.0
+        # "flat": no weighting; all timesteps contribute equally.
+        assert self.weight_mode == "flat"
+        return torch.ones_like(sigma)
 
     def __call__(self, net, images, labels=None, augment_pipe=None):
         """
