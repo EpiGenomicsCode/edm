@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import PIL.Image
 import dnnlib
-from torch_utils import distributed as dist, persistence
+from torch_utils import distributed as dist, persistence, misc
 
 
 #----------------------------------------------------------------------------
@@ -274,8 +274,8 @@ def parse_int_list(s):
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
-
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+@click.option('--state', 'state_path',     help='Optional training-state-*.pt to load raw (non-EMA) weights',        metavar='PATH', type=str, default=None)
+def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, state_path, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -300,10 +300,24 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     if dist.get_rank() != 0:
         torch.distributed.barrier()
 
-    # Load network.
+    # Load EMA network from snapshot.
     dist.print0(f'Loading network from "{network_pkl}"...')
     with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-        net = pickle.load(f)['ema'].to(device)
+        snapshot_data = pickle.load(f)
+    if 'ema' not in snapshot_data:
+        raise KeyError(f'"{network_pkl}" does not contain an EMA network (expected key \'ema\').')
+
+    net = snapshot_data['ema'].to(device)
+    net.eval().requires_grad_(False)
+
+    # Optionally load raw (non-EMA) training weights from a matching training-state-*.pt.
+    if state_path is not None:
+        dist.print0(f'Loading raw training weights from "{state_path}"...')
+        state = torch.load(state_path, map_location=torch.device('cpu'))
+        if 'net' not in state:
+            raise KeyError(f'"{state_path}" does not contain a \'net\' entry (expected raw training network).')
+        # Copy parameters/buffers into EMA-shaped net so architecture & hooks match snapshot.
+        misc.copy_params_and_buffers(src_module=state['net'], dst_module=net, require_all=True)
 
     # Other ranks follow.
     if dist.get_rank() == 0:
