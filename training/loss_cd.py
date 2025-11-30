@@ -88,7 +88,7 @@ class EDMConsistencyDistillLoss:
         sigma_min: float = 2e-3,
         sigma_max: float = 80.0,
         loss_type: str = "huber",    # "huber" | "l2"
-        weight_mode: str = "edm",    # "edm" | "vlike" | "flat"
+        weight_mode: str = "edm",    # "edm" | "vlike" | "flat" | "snr" | "snr+1" | "karras" | "truncated-snr" | "uniform"
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
@@ -96,7 +96,17 @@ class EDMConsistencyDistillLoss:
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
         assert loss_type in ("huber", "l2")
-        assert weight_mode in ("edm", "vlike", "flat")
+        assert weight_mode in (
+            "edm",
+            "vlike",
+            "flat",
+            # OpenAI consistency models style schedules (cm/karras_diffusion.get_weightings):
+            "snr",
+            "snr+1",
+            "karras",
+            "truncated-snr",
+            "uniform",
+        )
         self.teacher_net = teacher_net.eval().requires_grad_(False)
         self.S = int(S)
         self.T_start = int(T_start)
@@ -223,15 +233,49 @@ class EDMConsistencyDistillLoss:
         return sigmas
 
     def _weight(self, sigma: torch.Tensor) -> torch.Tensor:
-        # sigma expected shape [N,1,1,1]
+        """
+        Per-sample weighting as a function of sigma_t.
+
+        This function is applied exactly once per sampled teacher timestep σ_t,
+        and the resulting per-sample scalar is broadcast over BCHW to weight
+        the per-pixel residuals, matching the training dynamics used in:
+
+        - EDM teacher training (Karras et al. 2022), via `weight_mode="edm"`.
+        - OpenAI consistency models (cm/karras_diffusion.py), via the
+          weight_schedules "snr", "snr+1", "karras", "truncated-snr", "uniform".
+        """
+        # sigma is expected to be shape [N,1,1,1] (or broadcastable to that).
         if self.weight_mode == "edm":
-            # EDM-style weighting (inverse SNR^2), matches original teacher training.
+            # EDM-style weighting (inverse SNR^2), matches original teacher training:
+            #   w(σ) ∝ 1/σ^2 + 1/σ_data^2  (up to a global scale 1/σ_data^2).
             return (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+
         if self.weight_mode == "vlike":
             # v-prediction-like weighting: 1/σ^2 + 1
             return (1.0 / (sigma ** 2)) + 1.0
-        # "flat": no weighting; all timesteps contribute equally.
-        assert self.weight_mode == "flat"
+
+        if self.weight_mode == "flat":
+            # "flat": no weighting; all timesteps contribute equally.
+            return torch.ones_like(sigma)
+
+        # OpenAI consistency models style schedules (cm/karras_diffusion.get_weightings).
+        # Define SNR(σ) = 1/σ^2, then:
+        #   "snr"          -> w = snr
+        #   "snr+1"        -> w = snr + 1
+        #   "karras"       -> w = snr + 1/σ_data^2
+        #   "truncated-snr"-> w = max(snr, 1)
+        #   "uniform"      -> w = 1
+        snr = 1.0 / (sigma ** 2 + 1e-20)
+        if self.weight_mode == "snr":
+            return snr
+        if self.weight_mode == "snr+1":
+            return snr + 1.0
+        if self.weight_mode == "karras":
+            return snr + (1.0 / (self.sigma_data ** 2))
+        if self.weight_mode == "truncated-snr":
+            return torch.clamp(snr, min=1.0)
+        # "uniform": OpenAI's name; identical to our "flat" schedule.
+        assert self.weight_mode == "uniform"
         return torch.ones_like(sigma)
 
     def __call__(self, net, images, labels=None, augment_pipe=None):
