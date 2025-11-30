@@ -60,7 +60,7 @@ def parse_int_list(s):
 @click.option('--sigma_min',     help='Minimum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.002, show_default=True)
 @click.option('--sigma_max',     help='Maximum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=80.0, show_default=True)
 @click.option('--cd_loss',       help='Consistency loss type', metavar='huber|l2', type=click.Choice(['huber', 'l2']), default='huber', show_default=True)
-@click.option('--cd_weight_mode',help='Consistency weight mode', metavar='edm|vlike', type=click.Choice(['edm', 'vlike']), default='edm', show_default=True)
+@click.option('--cd_weight_mode',help='Consistency weight mode', metavar='edm|vlike|flat', type=click.Choice(['edm', 'vlike', 'flat']), default='edm', show_default=True)
 @click.option('--snap_cd_eval',  help='Optional: ticks interval for tiny S-step sanity samples (0=off)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
 
 # Hyperparameters.
