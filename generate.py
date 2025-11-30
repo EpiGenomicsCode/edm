@@ -254,7 +254,7 @@ def parse_int_list(s):
 #----------------------------------------------------------------------------
 
 @click.command()
-@click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
+@click.option('--network', 'network_pkl',  help='Network pickle filename (EMA snapshot); required if --state is not set', metavar='PATH|URL', type=str, required=False, default=None)
 @click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
 @click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
@@ -311,6 +311,8 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, state_p
         net = state['net'].to(device)
         net.eval().requires_grad_(False)
     else:
+        if network_pkl is None:
+            raise click.ClickException("Missing required option '--network' when --state is not provided.")
         dist.print0(f'Loading network (EMA) from "{network_pkl}"...')
         with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
             snapshot_data = pickle.load(f)
