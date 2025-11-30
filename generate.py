@@ -300,24 +300,24 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, state_p
     if dist.get_rank() != 0:
         torch.distributed.barrier()
 
-    # Load EMA network from snapshot.
-    dist.print0(f'Loading network from "{network_pkl}"...')
-    with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-        snapshot_data = pickle.load(f)
-    if 'ema' not in snapshot_data:
-        raise KeyError(f'"{network_pkl}" does not contain an EMA network (expected key \'ema\').')
-
-    net = snapshot_data['ema'].to(device)
-    net.eval().requires_grad_(False)
-
-    # Optionally load raw (non-EMA) training weights from a matching training-state-*.pt.
+    # Load network:
+    # - If state_path is given, use the raw training net from training-state-*.pt (no EMA at all).
+    # - Otherwise, fall back to EMA from snapshot for standard generation.
     if state_path is not None:
-        dist.print0(f'Loading raw training weights from "{state_path}"...')
+        dist.print0(f'Loading raw training weights from "{state_path}" (ignoring EMA)...')
         state = torch.load(state_path, map_location=torch.device('cpu'))
         if 'net' not in state:
             raise KeyError(f'"{state_path}" does not contain a \'net\' entry (expected raw training network).')
-        # Copy parameters/buffers into EMA-shaped net so architecture & hooks match snapshot.
-        misc.copy_params_and_buffers(src_module=state['net'], dst_module=net, require_all=True)
+        net = state['net'].to(device)
+        net.eval().requires_grad_(False)
+    else:
+        dist.print0(f'Loading network (EMA) from "{network_pkl}"...')
+        with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
+            snapshot_data = pickle.load(f)
+        if 'ema' not in snapshot_data:
+            raise KeyError(f'"{network_pkl}" does not contain an EMA network (expected key \'ema\').')
+        net = snapshot_data['ema'].to(device)
+        net.eval().requires_grad_(False)
 
     # Other ranks follow.
     if dist.get_rank() == 0:
