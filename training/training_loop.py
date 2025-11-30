@@ -96,7 +96,15 @@ def training_loop(
     # Disable broadcast_buffers since we only use GroupNorm (no running stats).
     # Leave static_graph at its default (False) to avoid the reducer expect_autograd_hooks_
     # assertions we are seeing with this particular PyTorch build.
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
+    # Explicitly disable gradient_as_bucket_view to avoid rare reducer bucket
+    # bugs observed with this PyTorch/NCCL combination (negative-dimension
+    # tensors when rebuilding buckets), at a small performance cost.
+    ddp = torch.nn.parallel.DistributedDataParallel(
+        net,
+        device_ids=[device],
+        broadcast_buffers=False,
+        gradient_as_bucket_view=False,
+    )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
     # Seed student from teacher AFTER DDP wrapping (if CD mode and shapes match).
