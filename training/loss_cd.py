@@ -92,8 +92,7 @@ class EDMConsistencyDistillLoss:
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
-        use_teacher_for_general: bool = False,  # TEMP debug hook: use teacher at σ_s for general edges instead of student
-        target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA)
+        target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA or teacher)
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
@@ -122,15 +121,11 @@ class EDMConsistencyDistillLoss:
         self.sigma_data = float(sigma_data)
         self.enable_stats = enable_stats
         self.debug_invariants = debug_invariants
-        # TEMP debug hook (2025-11, GH200 cluster investigation):
-        # When True, general interior edges will evaluate the denoiser at σ_s using
-        # the frozen teacher weights instead of the student. This does NOT affect
-        # terminal or boundary-snap edges. Default=False to preserve standard CD.
-        self.use_teacher_for_general = use_teacher_for_general
         # Optional target network for sigma_s denoiser (OpenAI CM style).
-        # If provided, general edges will use target_net instead of net for the
-        # sigma_s denoiser call. target_net should be an EMA copy of the student
-        # maintained by the training loop.
+        # Three modes via training_loop's cd_target_mode:
+        # - None (default): use live student weights at σ_s
+        # - EMA copy of student: stabilizes training (OpenAI's approach, rate=0.95)
+        # - Frozen teacher: for debugging
         self.target_net = target_net
 
         # Global kimg for teacher annealing; set externally by training loop.
@@ -422,27 +417,21 @@ class EDMConsistencyDistillLoss:
         sigma_ref_vec[boundary_mask] = sigma_s_eff[boundary_mask]
         
         # General interior edges: push from σ_s to σ_bdry using a denoiser at σ_s.
-        # Three modes:
-        # 1. use_teacher_for_general=True: use TEACHER at σ_s (debug hook)
-        # 2. target_net is provided: use TARGET (EMA) at σ_s (OpenAI CM style)
-        # 3. default: use live STUDENT at σ_s (standard CD)
+        # Two modes (controlled via training_loop's cd_target_mode):
+        # 1. target_net is provided: use TARGET (EMA or teacher) at σ_s (OpenAI CM style)
+        # 2. default: use live STUDENT at σ_s (standard CD)
         if general_mask.any():
             idx_g = general_mask
             with torch.no_grad():
-                if self.use_teacher_for_general:
-                    # TEMP debug path: use TEACHER weights to evaluate denoiser at σ_s.
-                    # We pass 1D sigma_s_eff[idx_g] to match EDMPrecond interface.
-                    x_hat_s_ng = self.teacher_net(
-                        x_s_teach[idx_g],
-                        sigma_s_eff[idx_g],
-                        labels[idx_g] if labels is not None else None,
-                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
-                    ).to(torch.float32)
-                elif self.target_net is not None:
-                    # OpenAI CM style: use TARGET (EMA) at σ_s.
+                if self.target_net is not None:
+                    # Use target network (EMA or teacher) at σ_s.
+                    # Note: if target_net is the teacher, we pass sigma_s_eff (1D) to match
+                    # the teacher's EDMPrecond interface; if it's the student EMA, we pass
+                    # sigma_s (4D broadcast). Both work because EDMPrecond accepts both shapes.
+                    sigma_for_target = sigma_s_eff[idx_g] if self.target_net is self.teacher_net else sigma_s[idx_g]
                     x_hat_s_ng = self.target_net(
                         x_s_teach[idx_g],
-                        sigma_s[idx_g],              # [N_g,1,1,1]
+                        sigma_for_target,
                         labels[idx_g] if labels is not None else None,
                         augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
                     ).to(torch.float32)

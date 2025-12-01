@@ -170,7 +170,7 @@ def training_loop(
             # Use the target EMA network.
             loss_fn.set_target_net(target_ema_net)
         elif cd_target_mode == 'teacher':
-            # Use the frozen teacher for sigma_s denoiser (equivalent to use_teacher_for_general=True).
+            # Use the frozen teacher for sigma_s denoiser.
             loss_fn.set_target_net(loss_fn.teacher_net)
             dist.print0('[CD TARGET] Using frozen teacher for sigma_s denoiser.')
         else:
@@ -478,6 +478,8 @@ def training_loop(
             dist.print0(f'[CD STATS] failed: {_e}')
         
         # Built-in validation hook (runs on schedule; blocks training).
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] before maybe_validate', flush=True)
         try:
             cur_kimg = cur_nimg // 1000
             maybe_validate(
@@ -491,31 +493,53 @@ def training_loop(
             )
         except Exception as _e:
             dist.print0(f'[VAL] validation failed: {_e}')
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] after maybe_validate', flush=True)
 
         # Save network snapshot (after validation on this tick).
         if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: starting', flush=True)
             data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
             # Also save target_ema if it exists (for CD target mode).
             if target_ema_net is not None:
                 data['target_ema'] = target_ema_net
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: processing {len(data)} items', flush=True)
             for key, value in data.items():
                 if isinstance(value, torch.nn.Module):
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: deepcopy {key}', flush=True)
                     value = copy.deepcopy(value).eval().requires_grad_(False)
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: check_ddp_consistency {key}', flush=True)
                     misc.check_ddp_consistency(value)
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: move {key} to CPU', flush=True)
                     data[key] = value.cpu()
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: {key} done', flush=True)
                 del value  # conserve memory
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: writing to disk (rank 0 only)', flush=True)
             if dist.get_rank() == 0:
                 with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
                     pickle.dump(data, f)
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: done', flush=True)
             del data  # conserve memory
 
         # Save full dump of the training state (after validation and snapshot).
         if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] state_dump: starting', flush=True)
             state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
             # Also save target_ema state if it exists.
             if target_ema_net is not None:
                 state_dict['target_ema'] = target_ema_net
             torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] state_dump: done', flush=True)
 
         # Update state.
         cur_tick += 1
