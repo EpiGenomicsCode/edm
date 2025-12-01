@@ -135,6 +135,7 @@ def main(**kwargs):
         --data=datasets/cifar10-32x32.zip --cond=1 --arch=ddpmpp
     """
     opts = dnnlib.EasyDict(kwargs)
+
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
 
