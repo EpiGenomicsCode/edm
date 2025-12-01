@@ -284,6 +284,8 @@ def training_loop(
     ema_updates = 0
     last_loss_scalar = None
     while True:
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] loop iter start: cur_nimg={cur_nimg}', flush=True)
 
         # Make teacher annealing resume-aware by exposing global kimg to the loss.
         try:
@@ -293,15 +295,27 @@ def training_loop(
             pass
 
         # Accumulate gradients.
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] zero_grad', flush=True)
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] round {round_idx}: fetching batch', flush=True)
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: batch fetched, moving to device', flush=True)
                 images = images.to(device).to(torch.float32) / 127.5 - 1
                 labels = labels.to(device)
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: calling loss_fn', flush=True)
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: loss computed, calling backward', flush=True)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: backward done', flush=True)
                 try:
                     last_loss_scalar = float(loss.mean().detach().cpu().item())
                 except Exception:
@@ -331,6 +345,8 @@ def training_loop(
             continue
 
         # Print status line, accumulating the same information in training_stats.
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] tick end: gathering stats', flush=True)
         tick_end_time = time.time()
         fields = []
         fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
@@ -343,7 +359,11 @@ def training_loop(
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
         fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
         torch.cuda.reset_peak_memory_stats()
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] tick end: printing status', flush=True)
         dist.print0(' '.join(fields))
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] tick end: status printed', flush=True)
 
         # Check for abort.
         if (not done) and dist.should_stop():
