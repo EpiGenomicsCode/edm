@@ -92,7 +92,7 @@ class EDMConsistencyDistillLoss:
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
-        use_teacher_for_general: bool = True,  # TEMP debug hook: use teacher at σ_s for general edges instead of student
+        use_teacher_for_general: bool = False,  # TEMP debug hook: use teacher at σ_s for general edges instead of student
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start

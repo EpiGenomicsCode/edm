@@ -104,6 +104,7 @@ def training_loop(
         device_ids=[device],
         broadcast_buffers=False,
         gradient_as_bucket_view=False,
+        static_graph=True,  # assume fixed graph/parameter usage; avoids dynamic bucket rebuilds
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
