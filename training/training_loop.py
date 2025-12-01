@@ -530,7 +530,12 @@ def training_loop(
             del data  # conserve memory
 
         # Save full dump of the training state (after validation and snapshot).
-        if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
+        # NOTE: Only rank 0 writes the file, but ALL ranks must wait before starting the
+        # next iteration to avoid some ranks entering the next backward() while rank 0
+        # is still busy with torch.save(), which would otherwise cause NCCL allreduce
+        # timeouts (some ranks enqueuing gradient allreduces while others haven't yet).
+        need_state_dump = (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0
+        if need_state_dump and dist.get_rank() == 0:
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] state_dump: starting', flush=True)
             state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
@@ -540,6 +545,10 @@ def training_loop(
             torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] state_dump: done', flush=True)
+        # All ranks participate in this barrier exactly on the same ticks where we dump
+        # state, ensuring no one starts the next iteration early relative to rank 0.
+        if need_state_dump:
+            torch.distributed.barrier()
 
         # Update state.
         cur_tick += 1
