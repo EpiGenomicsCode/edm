@@ -93,6 +93,7 @@ class EDMConsistencyDistillLoss:
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
         use_teacher_for_general: bool = False,  # TEMP debug hook: use teacher at σ_s for general edges instead of student
+        target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA)
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
@@ -126,6 +127,11 @@ class EDMConsistencyDistillLoss:
         # the frozen teacher weights instead of the student. This does NOT affect
         # terminal or boundary-snap edges. Default=False to preserve standard CD.
         self.use_teacher_for_general = use_teacher_for_general
+        # Optional target network for sigma_s denoiser (OpenAI CM style).
+        # If provided, general edges will use target_net instead of net for the
+        # sigma_s denoiser call. target_net should be an EMA copy of the student
+        # maintained by the training loop.
+        self.target_net = target_net
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -145,6 +151,14 @@ class EDMConsistencyDistillLoss:
         the current global kimg (including resume_kimg).
         """
         self._global_kimg = float(kimg)
+    
+    def set_target_net(self, target_net) -> None:
+        """
+        Set or update the target network used for sigma_s denoiser in general edges.
+        The training loop is responsible for maintaining this EMA copy and updating
+        it via this method.
+        """
+        self.target_net = target_net
     
     def get_edge_stats(self, reset: bool = True) -> dict:
         """
@@ -408,9 +422,10 @@ class EDMConsistencyDistillLoss:
         sigma_ref_vec[boundary_mask] = sigma_s_eff[boundary_mask]
         
         # General interior edges: push from σ_s to σ_bdry using a denoiser at σ_s.
-        # By default we use the STUDENT at σ_s (standard CD). For temporary debugging,
-        # we can optionally use the TEACHER at σ_s instead, controlled by
-        # self.use_teacher_for_general. This does NOT affect terminal or boundary-snap edges.
+        # Three modes:
+        # 1. use_teacher_for_general=True: use TEACHER at σ_s (debug hook)
+        # 2. target_net is provided: use TARGET (EMA) at σ_s (OpenAI CM style)
+        # 3. default: use live STUDENT at σ_s (standard CD)
         if general_mask.any():
             idx_g = general_mask
             with torch.no_grad():
@@ -423,8 +438,16 @@ class EDMConsistencyDistillLoss:
                         labels[idx_g] if labels is not None else None,
                         augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
                     ).to(torch.float32)
+                elif self.target_net is not None:
+                    # OpenAI CM style: use TARGET (EMA) at σ_s.
+                    x_hat_s_ng = self.target_net(
+                        x_s_teach[idx_g],
+                        sigma_s[idx_g],              # [N_g,1,1,1]
+                        labels[idx_g] if labels is not None else None,
+                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                    ).to(torch.float32)
                 else:
-                    # Standard path: use STUDENT at σ_s.
+                    # Standard path: use live STUDENT at σ_s.
                     x_hat_s_ng = net(
                         x_s_teach[idx_g],
                         sigma_s[idx_g],              # [N_g,1,1,1]

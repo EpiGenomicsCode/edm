@@ -69,6 +69,8 @@ def parse_int_list(s):
     show_default=True,
 )
 @click.option('--snap_cd_eval',  help='Optional: ticks interval for tiny S-step sanity samples (0=off)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
+@click.option('--cd_target_mode', help='Target network for sigma_s denoiser: live|ema|teacher', metavar='STR', type=click.Choice(['live', 'ema', 'teacher']), default='live', show_default=True)
+@click.option('--cd_target_ema', help='EMA rate for target network (only used if cd_target_mode=ema)', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.95, show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -232,6 +234,9 @@ def main(**kwargs):
         # Provenance and optional eval knob (stored only).
         c.teacher = opts.teacher
         c.snap_cd_eval = opts.snap_cd_eval
+        # Target network mode for sigma_s denoiser (OpenAI CM style).
+        c.cd_target_mode = opts.cd_target_mode
+        c.cd_target_ema = opts.cd_target_ema
         # Note: do NOT auto-seed student weights from teacher by default to avoid
         # label embedding shape mismatches across checkpoints/datasets.
 

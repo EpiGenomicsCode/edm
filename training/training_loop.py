@@ -53,6 +53,8 @@ def training_loop(
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
     validation_kwargs   = None,     # Validation configuration (PRD-04).
+    cd_target_mode      = 'live',   # Target network mode for CD sigma_s denoiser: 'live' | 'ema' | 'teacher'.
+    cd_target_ema       = 0.95,     # EMA rate for target network (only used if cd_target_mode='ema').
 ):
     # Initialize.
     start_time = time.time()
@@ -115,6 +117,13 @@ def training_loop(
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
+    # Initialize target network for CD sigma_s denoiser (OpenAI CM style).
+    # This is separate from the validation EMA and is used during training.
+    target_ema_net = None
+    if hasattr(loss_fn, 'teacher_net') and cd_target_mode == 'ema':
+        target_ema_net = copy.deepcopy(net).eval().requires_grad_(False)
+        dist.print0(f'[CD TARGET] Initialized target EMA network with rate={cd_target_ema}')
+    
     # Seed student from teacher AFTER DDP wrapping (if CD mode and shapes match).
     # This avoids NCCL desync issues during DDP initialization.
     if hasattr(loss_fn, 'teacher_net'):
@@ -140,6 +149,9 @@ def training_loop(
                 misc.copy_params_and_buffers(src_module=teacher, dst_module=net, require_all=False)
                 # Also update EMA to start from teacher weights.
                 misc.copy_params_and_buffers(src_module=teacher, dst_module=ema, require_all=False)
+                # Also update target EMA if it exists.
+                if target_ema_net is not None:
+                    misc.copy_params_and_buffers(src_module=teacher, dst_module=target_ema_net, require_all=False)
                 if dist.get_rank() == 0:
                     dist.print0('[CD INIT] Seeded student & EMA from teacher (all parameter/buffer shapes match).')
             else:
@@ -148,6 +160,21 @@ def training_loop(
         except Exception as _e:
             if dist.get_rank() == 0:
                 dist.print0(f'[CD INIT] Failed to seed from teacher: {_e}')
+    
+    # Configure the loss function's target network based on cd_target_mode.
+    if hasattr(loss_fn, 'set_target_net'):
+        if cd_target_mode == 'live':
+            # No target network; loss will use live student weights (default behavior).
+            loss_fn.set_target_net(None)
+        elif cd_target_mode == 'ema':
+            # Use the target EMA network.
+            loss_fn.set_target_net(target_ema_net)
+        elif cd_target_mode == 'teacher':
+            # Use the frozen teacher for sigma_s denoiser (equivalent to use_teacher_for_general=True).
+            loss_fn.set_target_net(loss_fn.teacher_net)
+            dist.print0('[CD TARGET] Using frozen teacher for sigma_s denoiser.')
+        else:
+            raise ValueError(f'Unknown cd_target_mode: {cd_target_mode}')
 
     # Optional W&B initialization (async/threaded).
     wandb_run = None
@@ -200,6 +227,10 @@ def training_loop(
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
+        # Load target_ema if it was saved and we're using it.
+        if target_ema_net is not None and 'target_ema' in data:
+            misc.copy_params_and_buffers(src_module=data['target_ema'], dst_module=target_ema_net, require_all=True)
+            dist.print0('[CD TARGET] Loaded target EMA from training state.')
         del data # conserve memory
 
     # Broadcast run_dir to all ranks (rank 0 has it, others have None).
@@ -329,7 +360,7 @@ def training_loop(
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
 
-        # Update EMA.
+        # Update EMA (validation/snapshot EMA).
         ema_halflife_nimg = ema_halflife_kimg * 1000
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
@@ -337,6 +368,18 @@ def training_loop(
         for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
         ema_updates += 1
+        
+        # Update target EMA (for CD sigma_s denoiser, OpenAI CM style).
+        # This uses a fixed EMA rate (no rampup), matching OpenAI's "fixed" mode.
+        if target_ema_net is not None:
+            target_ema_beta = cd_target_ema  # e.g., 0.95
+            for p_target, p_net in zip(target_ema_net.parameters(), net.parameters()):
+                p_target.mul_(target_ema_beta).add_(p_net.detach(), alpha=1 - target_ema_beta)
+            # Update the loss function's reference to the target network.
+            # (The target_net itself is updated in-place, but we call set_target_net
+            # to ensure the loss function has the correct reference after resume/reload.)
+            if hasattr(loss_fn, 'set_target_net'):
+                loss_fn.set_target_net(target_ema_net)
 
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
@@ -452,6 +495,9 @@ def training_loop(
         # Save network snapshot (after validation on this tick).
         if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
             data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            # Also save target_ema if it exists (for CD target mode).
+            if target_ema_net is not None:
+                data['target_ema'] = target_ema_net
             for key, value in data.items():
                 if isinstance(value, torch.nn.Module):
                     value = copy.deepcopy(value).eval().requires_grad_(False)
@@ -465,7 +511,11 @@ def training_loop(
 
         # Save full dump of the training state (after validation and snapshot).
         if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
+            # Also save target_ema state if it exists.
+            if target_ema_net is not None:
+                state_dict['target_ema'] = target_ema_net
+            torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
 
         # Update state.
         cur_tick += 1
