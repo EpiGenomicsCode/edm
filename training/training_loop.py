@@ -93,18 +93,25 @@ def training_loop(
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    # Disable broadcast_buffers since we only use GroupNorm (no running stats).
-    # Leave static_graph at its default (False) to avoid the reducer expect_autograd_hooks_
-    # assertions we are seeing with this particular PyTorch build.
-    # Explicitly disable gradient_as_bucket_view to avoid rare reducer bucket
-    # bugs observed with this PyTorch/NCCL combination (negative-dimension
-    # tensors when rebuilding buckets), at a small performance cost.
+    # DDP configuration:
+    # - Disable broadcast_buffers since we only use GroupNorm (no running stats).
+    # - Disable gradient_as_bucket_view to avoid rare reducer bucket bugs
+    #   observed with this PyTorch/NCCL combination (negative-dimension tensors
+    #   when rebuilding buckets).
+    # - Keep static_graph=False because enabling it with this CD graph +
+    #   PyTorch build has been observed to trigger internal
+    #   expect_autograd_hooks_ assertions in the reducer.
+    # - Enable find_unused_parameters=True as a conservative setting so that
+    #   the reducer tolerates any parameters that might not participate in the
+    #   backward graph on a given iteration (even though we expect the graph to
+    #   be effectively fixed in practice).
     ddp = torch.nn.parallel.DistributedDataParallel(
         net,
         device_ids=[device],
         broadcast_buffers=False,
         gradient_as_bucket_view=False,
-        static_graph=True,  # assume fixed graph/parameter usage; avoids dynamic bucket rebuilds
+        static_graph=False,
+        find_unused_parameters=True,
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
