@@ -92,6 +92,7 @@ class EDMConsistencyDistillLoss:
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
+        use_teacher_for_general: bool = True,  # TEMP debug hook: use teacher at σ_s for general edges instead of student
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
@@ -120,6 +121,11 @@ class EDMConsistencyDistillLoss:
         self.sigma_data = float(sigma_data)
         self.enable_stats = enable_stats
         self.debug_invariants = debug_invariants
+        # TEMP debug hook (2025-11, GH200 cluster investigation):
+        # When True, general interior edges will evaluate the denoiser at σ_s using
+        # the frozen teacher weights instead of the student. This does NOT affect
+        # terminal or boundary-snap edges. Default=False to preserve standard CD.
+        self.use_teacher_for_general = use_teacher_for_general
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -401,16 +407,30 @@ class EDMConsistencyDistillLoss:
         x_ref_bdry[boundary_mask] = x_s_teach[boundary_mask].to(torch.float32)
         sigma_ref_vec[boundary_mask] = sigma_s_eff[boundary_mask]
         
-        # General interior edges: push from σ_s to σ_bdry using student
+        # General interior edges: push from σ_s to σ_bdry using a denoiser at σ_s.
+        # By default we use the STUDENT at σ_s (standard CD). For temporary debugging,
+        # we can optionally use the TEACHER at σ_s instead, controlled by
+        # self.use_teacher_for_general. This does NOT affect terminal or boundary-snap edges.
         if general_mask.any():
             idx_g = general_mask
             with torch.no_grad():
-                x_hat_s_ng = net(
-                    x_s_teach[idx_g],
-                    sigma_s[idx_g],              # [N_g,1,1,1]
-                    labels[idx_g] if labels is not None else None,
-                    augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
-                ).to(torch.float32)
+                if self.use_teacher_for_general:
+                    # TEMP debug path: use TEACHER weights to evaluate denoiser at σ_s.
+                    # We pass 1D sigma_s_eff[idx_g] to match EDMPrecond interface.
+                    x_hat_s_ng = self.teacher_net(
+                        x_s_teach[idx_g],
+                        sigma_s_eff[idx_g],
+                        labels[idx_g] if labels is not None else None,
+                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                    ).to(torch.float32)
+                else:
+                    # Standard path: use STUDENT at σ_s.
+                    x_hat_s_ng = net(
+                        x_s_teach[idx_g],
+                        sigma_s[idx_g],              # [N_g,1,1,1]
+                        labels[idx_g] if labels is not None else None,
+                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                    ).to(torch.float32)
             
             ratio_s_b = (sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)).to(torch.float32)
             x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
