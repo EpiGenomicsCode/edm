@@ -525,6 +525,10 @@ def training_loop(
             if dist.get_rank() == 0:
                 with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
                     pickle.dump(data, f)
+            # CRITICAL: All ranks must wait for rank 0 to finish writing before continuing.
+            # Without this barrier, other ranks will start the next training iteration while
+            # rank 0 is still writing, causing NCCL timeout when they try to synchronize.
+            torch.distributed.barrier()
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] snapshot: done', flush=True)
             del data  # conserve memory
