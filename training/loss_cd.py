@@ -448,6 +448,11 @@ class EDMConsistencyDistillLoss:
             x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
             sigma_ref_vec[idx_g] = sigma_bdry_vec[idx_g]
 
+        # Gain diagnostics: σ_ref / σ_t and CD gain 1 / (1 - σ_ref/σ_t).
+        # This is purely diagnostic and does not affect training dynamics.
+        ratio_ref = sigma_ref_vec / torch.clamp(sigma_t_vec, min=1e-12)
+        gain = 1.0 / torch.clamp(1.0 - ratio_ref, min=1e-6)  # [N]
+
         # Compute inv-DDIM target at t using per-sample sigma_ref (PRD §4.2.6)
         x_hat_t_star = inv_ddim_edm(
             x_ref=x_ref_bdry,
@@ -489,12 +494,46 @@ class EDMConsistencyDistillLoss:
         # Training stats reporting: batch means (PRD §4.2.9)
         if self.enable_stats:
             with torch.no_grad():
+                # Core loss and sigma diagnostics.
                 training_stats.report('Loss/cd', loss)
                 training_stats.report('CD/sigma_t', sigma_t_vec.mean())
                 training_stats.report('CD/sigma_s', sigma_s_eff.mean())
                 training_stats.report('CD/sigma_bdry', sigma_bdry_vec.mean())
                 training_stats.report('CD/seg_id', j.float().mean())
                 training_stats.report('CD/T_edges', torch.as_tensor(float(T_edges), device=device))
+
+                # Gain statistics (overall).
+                training_stats.report('CD/gain_mean', gain.mean())
+                training_stats.report('CD/gain_max', gain.max())
+                training_stats.report('CD/gain_95p', gain.quantile(0.95))
+                training_stats.report('CD/gain_99p', gain.quantile(0.99))
+
+                # Gain statistics per edge type.
+                gain_all = gain
+                gain_terminal = gain[is_terminal]
+                gain_boundary = gain[is_boundary_snap]
+                gain_general = gain[general_mask]
+
+                # Use empty lists when there are no samples for a given type so that
+                # the set and ordering of statistic names remain consistent.
+                training_stats.report('CD/gain_all', gain_all)
+                training_stats.report(
+                    'CD/gain_terminal_mean',
+                    gain_terminal.mean() if gain_terminal.numel() > 0 else [],
+                )
+                training_stats.report(
+                    'CD/gain_boundary_mean',
+                    gain_boundary.mean() if gain_boundary.numel() > 0 else [],
+                )
+                training_stats.report(
+                    'CD/gain_general_mean',
+                    gain_general.mean() if gain_general.numel() > 0 else [],
+                )
+
+                # Correlate gain with loss magnitude.
+                loss_mean_per_sample = loss.mean(dim=(1, 2, 3))  # [N]
+                training_stats.report('CD/loss_mean', loss_mean_per_sample.mean())
+                training_stats.report('CD/loss_gain_corr', (gain * loss_mean_per_sample).mean())
 
         return loss
 
