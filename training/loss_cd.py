@@ -535,6 +535,23 @@ class EDMConsistencyDistillLoss:
                 training_stats.report('CD/loss_mean', loss_mean_per_sample.mean())
                 training_stats.report('CD/loss_gain_corr', (gain * loss_mean_per_sample).mean())
 
+                # Cache last-step diagnostics for optional per-optimizer-step logging.
+                try:
+                    self._last_step_metrics = {
+                        'cd_gain_mean': float(gain.mean().detach().cpu()),
+                        'cd_gain_max': float(gain.max().detach().cpu()),
+                        'cd_gain_95p': float(gain.quantile(0.95).detach().cpu()),
+                        'cd_gain_99p': float(gain.quantile(0.99).detach().cpu()),
+                        'cd_gain_terminal_mean': float(gain_terminal.mean().detach().cpu()) if gain_terminal.numel() > 0 else None,
+                        'cd_gain_boundary_mean': float(gain_boundary.mean().detach().cpu()) if gain_boundary.numel() > 0 else None,
+                        'cd_gain_general_mean': float(gain_general.mean().detach().cpu()) if gain_general.numel() > 0 else None,
+                        'cd_loss_mean': float(loss_mean_per_sample.mean().detach().cpu()),
+                        'cd_loss_gain_corr': float((gain * loss_mean_per_sample).mean().detach().cpu()),
+                    }
+                except Exception:
+                    # Diagnostics are best-effort only; do not break training if something goes wrong.
+                    self._last_step_metrics = getattr(self, '_last_step_metrics', None)
+
         return loss
 
     def debug_batch(

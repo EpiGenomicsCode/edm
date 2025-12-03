@@ -312,6 +312,8 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
+    step_stats_jsonl = None
+    cur_step = 0
     ema_updates = 0
     last_loss_scalar = None
     while True:
@@ -355,10 +357,63 @@ def training_loop(
         # Update weights.
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+        # Sanitize gradients and compute global grad norm (per optimizer step).
+        total_grad_sq = torch.zeros([], device=device)
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+                param_norm = param.grad.detach().float().norm(2)
+                total_grad_sq = total_grad_sq + param_norm * param_norm
+        grad_global_norm = torch.sqrt(total_grad_sq)
+        training_stats.report('Grad/global_norm', grad_global_norm)
         optimizer.step()
+        # Per-optimizer-step diagnostics (rank 0 only, written to step_stats.jsonl and W&B).
+        if dist.get_rank() == 0:
+            if step_stats_jsonl is None and run_dir is not None:
+                step_stats_path = os.path.join(run_dir, 'step_stats.jsonl')
+                step_stats_jsonl = open(step_stats_path, 'at')
+            # Build a per-step metrics payload from loss + optimizer state.
+            step_record = {
+                'step': cur_step,
+                'nimg': int(cur_nimg),
+                'kimg': float(cur_nimg / 1e3),
+                'tick': int(cur_tick),
+                'grad_global_norm': float(grad_global_norm.detach().cpu()),
+            }
+            if hasattr(loss_fn, '_last_step_metrics') and isinstance(getattr(loss_fn, '_last_step_metrics'), dict):
+                step_record.update(loss_fn._last_step_metrics)
+            # Write to per-step JSONL if available.
+            if step_stats_jsonl is not None:
+                step_stats_jsonl.write(json.dumps(step_record) + '\n')
+                step_stats_jsonl.flush()
+            # Also log per-step metrics to W&B (no tick aggregation).
+            if wandb_run is not None:
+                try:
+                    import wandb as _wandb
+                    wandb_payload = {
+                        'opt_step': step_record['step'],
+                        'kimg': step_record['kimg'],
+                        'Grad/global_norm': step_record['grad_global_norm'],
+                    }
+                    # Map cached CD diagnostics (if present) to W&B-friendly names.
+                    cd_map = {
+                        'cd_gain_mean': 'CD/gain_mean',
+                        'cd_gain_max': 'CD/gain_max',
+                        'cd_gain_95p': 'CD/gain_95p',
+                        'cd_gain_99p': 'CD/gain_99p',
+                        'cd_gain_terminal_mean': 'CD/gain_terminal_mean',
+                        'cd_gain_boundary_mean': 'CD/gain_boundary_mean',
+                        'cd_gain_general_mean': 'CD/gain_general_mean',
+                        'cd_loss_mean': 'CD/loss_mean',
+                        'cd_loss_gain_corr': 'CD/loss_gain_corr',
+                    }
+                    for key_src, key_dst in cd_map.items():
+                        if key_src in step_record and step_record[key_src] is not None:
+                            wandb_payload[key_dst] = step_record[key_src]
+                    _wandb.log(wandb_payload, commit=True)
+                except Exception as _e:
+                    dist.print0(f'[W&B] per-step log failed: {_e}')
+        cur_step += 1
 
         # Update EMA (validation/snapshot EMA).
         ema_halflife_nimg = ema_halflife_kimg * 1000
@@ -424,6 +479,7 @@ def training_loop(
             # Optional W&B logging once per tick (async).
             if wandb_run is not None:
                 try:
+                    # Tick-level progress-only logging; detailed metrics are logged per optimizer step.
                     log_dict = dict(
                         progress_kimg=cur_nimg / 1e3,
                         tick=cur_tick,
@@ -447,10 +503,6 @@ def training_loop(
                                 log_dict['cd_edge/total_edges'] = edge_stats['total_edges']  # NEW: sampled edges
                     except Exception:
                         pass
-                    # Merge detailed training stats.
-                    stats_payload = training_stats.default_collector.as_dict()
-                    if isinstance(stats_payload, dict):
-                        log_dict.update(stats_payload)
                     import wandb as _wandb
                     _wandb.log(log_dict, commit=True)
                 except Exception as _e:
