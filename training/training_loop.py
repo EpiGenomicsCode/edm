@@ -357,6 +357,9 @@ def training_loop(
         # Update weights.
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+        # Capture the effective LR for this step (assume a single scalar LR across params).
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Sanitize gradients and compute global norms (per optimizer step).
         total_grad_sq = torch.zeros([], device=device)
         total_param_sq = torch.zeros([], device=device)
@@ -370,8 +373,11 @@ def training_loop(
                 total_grad_sq = total_grad_sq + grad_norm * grad_norm
         grad_global_norm = torch.sqrt(total_grad_sq)
         param_global_norm = torch.sqrt(total_param_sq)
-        update_over_param = grad_global_norm / torch.clamp(param_global_norm, min=1e-12)
+        # True update/param ratio, incorporating the current learning rate.
+        true_update_over_param = (current_lr * grad_global_norm) / torch.clamp(param_global_norm, min=1e-12)
         training_stats.report('Grad/global_norm', grad_global_norm)
+        training_stats.report('Grad/param_norm', param_global_norm)
+        training_stats.report('Grad/update_over_param', true_update_over_param)
         optimizer.step()
         # Per-optimizer-step diagnostics (rank 0 only, written to step_stats.jsonl and W&B).
         if dist.get_rank() == 0:
@@ -384,9 +390,10 @@ def training_loop(
                 'nimg': int(cur_nimg),
                 'kimg': float(cur_nimg / 1e3),
                 'tick': int(cur_tick),
+                'lr': float(current_lr),
                 'grad_global_norm': float(grad_global_norm.detach().cpu()),
                 'param_global_norm': float(param_global_norm.detach().cpu()),
-                'update_over_param': float(update_over_param.detach().cpu()),
+                'update_over_param': float(true_update_over_param.detach().cpu()),
                 'loss': float(last_loss_scalar) if last_loss_scalar is not None else None,
             }
             if hasattr(loss_fn, '_last_step_metrics') and isinstance(getattr(loss_fn, '_last_step_metrics'), dict):
@@ -403,7 +410,7 @@ def training_loop(
                         'opt_step': step_record['step'],
                         'kimg': step_record['kimg'],
                         'Grad/global_norm': step_record['grad_global_norm'],
-                        'Param/global_norm': step_record['param_global_norm'],
+                        'Grad/param_norm': step_record['param_global_norm'],
                         'Grad/update_over_param': step_record['update_over_param'],
                     }
                     # Per-step loss (separate from tick-level summary loss).
