@@ -12,7 +12,7 @@ from .consistency_ops import (
     make_karras_sigmas,
     partition_edges_into_segments,
     sample_segment_and_teacher_pair,
-    heun_hop_edm,
+    heun_hop_edm_stochastic,
     inv_ddim_edm,
     ddim_step_edm,
 )
@@ -87,6 +87,10 @@ class EDMConsistencyDistillLoss:
         rho: float = 7.0,            # Karras exponent
         sigma_min: float = 2e-3,
         sigma_max: float = 80.0,
+        S_churn: float = 40.0,       # Karras stochastic sampler defaults (ImageNet)
+        S_min: float = 0.05,
+        S_max: float = 50.0,
+        S_noise: float = 1.003,
         loss_type: str = "huber",    # "huber" | "l2"
         weight_mode: str = "edm",    # "edm" | "vlike" | "flat" | "snr" | "snr+1" | "karras" | "truncated-snr" | "uniform"
         sigma_data: float = 0.5,
@@ -116,6 +120,10 @@ class EDMConsistencyDistillLoss:
         self.rho = float(rho)
         self.sigma_min = float(sigma_min)
         self.sigma_max = float(sigma_max)
+        self.S_churn = float(S_churn)
+        self.S_min = float(S_min)
+        self.S_max = float(S_max)
+        self.S_noise = float(S_noise)
         self.loss_type = loss_type
         self.weight_mode = weight_mode
         self.sigma_data = float(sigma_data)
@@ -398,13 +406,18 @@ class EDMConsistencyDistillLoss:
         if non_terminal.any():
             idx = non_terminal
             with torch.no_grad():
-                x_s_teach_nt = heun_hop_edm(
+                x_s_teach_nt = heun_hop_edm_stochastic(
                     net=self.teacher_net,
                     x_t=x_t[idx],
                     sigma_t=sigma_t_vec[idx],     # [N_nt]
                     sigma_s=sigma_s_eff[idx],     # [N_nt], all > 0 here
                     class_labels=labels[idx] if labels is not None else None,
                     augment_labels=augment_labels[idx] if augment_labels is not None else None,
+                    num_steps=T_edges,
+                    S_churn=self.S_churn,
+                    S_min=self.S_min,
+                    S_max=self.S_max,
+                    S_noise=self.S_noise,
                 )
             x_s_teach[idx] = x_s_teach_nt
         
@@ -791,13 +804,18 @@ class EDMConsistencyDistillLoss:
             else:
                 # Interior edge: run teacher hop
                 with torch.no_grad():
-                    x_s_teach = heun_hop_edm(
+                    x_s_teach = heun_hop_edm_stochastic(
                         net=self.teacher_net,
                         x_t=x_t,
                         sigma_t=sigma_t_scalar,
                         sigma_s=sigma_s_scalar,
                         class_labels=labels_vis,
                         augment_labels=augment_labels,
+                        num_steps=T_edges,
+                        S_churn=self.S_churn,
+                        S_min=self.S_min,
+                        S_max=self.S_max,
+                        S_noise=self.S_noise,
                     )
                 
                 # Check if boundary coincides with teaching point
@@ -979,13 +997,18 @@ class EDMConsistencyDistillLoss:
             x_t = y + sigma_t * eps
             
             with torch.no_grad():
-                x_s_teach = heun_hop_edm(
+                x_s_teach = heun_hop_edm_stochastic(
                     net=self.teacher_net,
                     x_t=x_t,
                     sigma_t=sigma_t_scalar,
                     sigma_s=sigma_s_scalar,
                     class_labels=labels_vis,
                     augment_labels=augment_labels,
+                    num_steps=T_edges,
+                    S_churn=self.S_churn,
+                    S_min=self.S_min,
+                    S_max=self.S_max,
+                    S_noise=self.S_noise,
                 )
                 
                 # Check if at terminal edge
