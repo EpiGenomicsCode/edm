@@ -87,7 +87,7 @@ class EDMConsistencyDistillLoss:
         rho: float = 7.0,            # Karras exponent
         sigma_min: float = 2e-3,
         sigma_max: float = 80.0,
-        S_churn: float = 40.0,       # Karras stochastic sampler defaults (ImageNet)
+        S_churn: float = 0.0,        # Default to deterministic Heun (S_churn=0); stochastic churn breaks CD training
         S_min: float = 0.05,
         S_max: float = 50.0,
         S_noise: float = 1.003,
