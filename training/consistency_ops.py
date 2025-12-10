@@ -81,34 +81,37 @@ def filter_teacher_edges_by_sigma(
     eps: float = 1e-5,
 ) -> (torch.Tensor, int):
     """
-    Remove teacher edges whose upper sigma matches an interior student sigma
-    (within tolerance), except for the terminal edge. Always keep the first
-    edge (sigma_max) and the terminal edge (last positive -> 0).
+    Build a CD-specific teacher grid by removing teacher edges whose upper sigma
+    matches an interior student sigma (within tolerance), except for the terminal edge.
+    Always keep the first edge (sigma_max) and the terminal edge (last positive -> 0).
 
     Returns:
-        kept_idx: LongTensor of teacher upper indices k to keep (k in [0, T-1])
-        terminal_k: int index of the terminal teacher edge (last positive -> 0)
+        teacher_sigmas_cd: 1D tensor of length T_cd+1, descending, last entry 0
+        terminal_k_cd: index of the terminal teacher edge (last positive -> 0) in this CD grid
     """
     assert student_sigmas.ndim == 1 and teacher_sigmas.ndim == 1
     T = len(teacher_sigmas) - 1
     assert T >= 1
-    # terminal edge: last k with sigma_t > 0 and sigma_{k+1} == 0
-    terminal_k = None
+
+    # Find terminal edge in the original full grid: last k with sigma_t > 0 and sigma_{k+1} == 0
+    terminal_k_full = None
     for k in range(T - 1, -1, -1):
         if teacher_sigmas[k] > 0 and teacher_sigmas[k + 1] == 0:
-            terminal_k = k
+            terminal_k_full = k
             break
-    if terminal_k is None:
-        terminal_k = T - 1  # fallback
+    if terminal_k_full is None:
+        terminal_k_full = T - 1  # fallback
 
     student_interior = student_sigmas[1:-1]  # exclude sigma_max and 0
+
     kept = []
     for k in range(T):
         sigma_k = teacher_sigmas[k]
-        if k == 0 or k == terminal_k:
+        # Always keep very first edge and the original terminal edge
+        if k == 0 or k == terminal_k_full:
             kept.append(k)
             continue
-        # drop if matches any interior student sigma (relative tolerance)
+        # Drop if matches any interior student sigma (relative tolerance)
         match = False
         for s in student_interior:
             if torch.isclose(
@@ -122,7 +125,19 @@ def filter_teacher_edges_by_sigma(
         if match:
             continue
         kept.append(k)
-    return torch.tensor(kept, dtype=torch.long, device=teacher_sigmas.device), int(terminal_k)
+
+    kept_idx = torch.tensor(kept, dtype=torch.long, device=teacher_sigmas.device)
+
+    # Build compact CD teacher grid: kept sigmas + final zero
+    teacher_sigmas_cd = torch.cat(
+        [teacher_sigmas[kept_idx], teacher_sigmas[-1:].clone()], dim=0
+    )
+
+    # In this compact grid, terminal edge is the last positive -> 0 transition
+    # That's the second-to-last index (index T_cd - 1 where T_cd = len(kept))
+    terminal_k_cd = len(kept) - 1  # last kept index position, pointing to last positive before zero
+
+    return teacher_sigmas_cd, int(terminal_k_cd)
 
 
 def partition_edges_by_sigma(student_sigmas: torch.Tensor, teacher_sigmas: torch.Tensor) -> torch.Tensor:

@@ -317,24 +317,31 @@ class EDMConsistencyDistillLoss:
 
         # Build grids with terminal zeros.
         student_sigmas = self._build_student_grid(net=net, device=device)  # [S+1] with terminal 0
-        teacher_sigmas = self._build_teacher_grid(device=device)           # [T+1] with terminal 0
-        T_edges = teacher_sigmas.shape[0] - 1
 
-        # Partition teacher edges into S segments.
-        boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
-        sigma_bounds = None
-        terminal_k = T_edges - 1
+        # Full teacher grid from Karras schedule
+        teacher_sigmas_full = self._build_teacher_grid(device=device)      # [T+1] with terminal 0
+
         if self.anchor_by_sigma:
-            kept_idx, terminal_k = filter_teacher_edges_by_sigma(
-                student_sigmas=student_sigmas, teacher_sigmas=teacher_sigmas
+            # Build CD-specific teacher grid with duplicates removed
+            teacher_sigmas, terminal_k = filter_teacher_edges_by_sigma(
+                student_sigmas=student_sigmas,
+                teacher_sigmas=teacher_sigmas_full,
             )
-            # Mask out dropped teacher sigmas for boundary construction.
-            mask_keep = torch.zeros_like(teacher_sigmas, dtype=torch.bool)
-            mask_keep[kept_idx] = True
-            teacher_sigmas_for_bounds = teacher_sigmas.clone()
-            teacher_sigmas_for_bounds[~mask_keep] = float("inf")
+        else:
+            teacher_sigmas = teacher_sigmas_full
+            terminal_k = teacher_sigmas.shape[0] - 2  # last positive before terminal 0
+
+        # Now everything below uses the (maybe filtered) teacher_sigmas
+        T_edges = teacher_sigmas.shape[0] - 1  # number of edges in CD grid
+
+        # Index-based segment boundaries (for index-anchored path)
+        boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
+
+        sigma_bounds = None
+        if self.anchor_by_sigma:
             sigma_bounds = partition_edges_by_sigma(
-                student_sigmas=student_sigmas, teacher_sigmas=teacher_sigmas_for_bounds
+                student_sigmas=student_sigmas,
+                teacher_sigmas=teacher_sigmas,  # already filtered & strictly descending
             )
 
         # Sample per-sample edges: each element in batch gets independent (j, k_t, k_s, sigmas).
