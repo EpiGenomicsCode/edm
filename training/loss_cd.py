@@ -12,6 +12,7 @@ from .consistency_ops import (
     make_karras_sigmas,
     partition_edges_into_segments,
     partition_edges_by_sigma,
+    filter_teacher_edges_by_sigma,
     sample_segment_and_teacher_pair,
     heun_hop_edm_stochastic,
     inv_ddim_edm,
@@ -322,8 +323,19 @@ class EDMConsistencyDistillLoss:
         # Partition teacher edges into S segments.
         boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
         sigma_bounds = None
+        terminal_k = T_edges - 1
         if self.anchor_by_sigma:
-            sigma_bounds = partition_edges_by_sigma(student_sigmas=student_sigmas, teacher_sigmas=teacher_sigmas)
+            kept_idx, terminal_k = filter_teacher_edges_by_sigma(
+                student_sigmas=student_sigmas, teacher_sigmas=teacher_sigmas
+            )
+            # Mask out dropped teacher sigmas for boundary construction.
+            mask_keep = torch.zeros_like(teacher_sigmas, dtype=torch.bool)
+            mask_keep[kept_idx] = True
+            teacher_sigmas_for_bounds = teacher_sigmas.clone()
+            teacher_sigmas_for_bounds[~mask_keep] = float("inf")
+            sigma_bounds = partition_edges_by_sigma(
+                student_sigmas=student_sigmas, teacher_sigmas=teacher_sigmas_for_bounds
+            )
 
         # Sample per-sample edges: each element in batch gets independent (j, k_t, k_s, sigmas).
         sample_dict = sample_segment_and_teacher_pair(
@@ -334,6 +346,7 @@ class EDMConsistencyDistillLoss:
             device=device,
             anchor_by_sigma=self.anchor_by_sigma,
             sigma_bounds=sigma_bounds,
+            terminal_k=terminal_k,
         )
         
         # Extract per-sample vectors (all shape [N])

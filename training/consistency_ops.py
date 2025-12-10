@@ -75,6 +75,56 @@ def partition_edges_into_segments(T: int, S: int) -> torch.Tensor:
     return kb
 
 
+def filter_teacher_edges_by_sigma(
+    student_sigmas: torch.Tensor,
+    teacher_sigmas: torch.Tensor,
+    eps: float = 1e-5,
+) -> (torch.Tensor, int):
+    """
+    Remove teacher edges whose upper sigma matches an interior student sigma
+    (within tolerance), except for the terminal edge. Always keep the first
+    edge (sigma_max) and the terminal edge (last positive -> 0).
+
+    Returns:
+        kept_idx: LongTensor of teacher upper indices k to keep (k in [0, T-1])
+        terminal_k: int index of the terminal teacher edge (last positive -> 0)
+    """
+    assert student_sigmas.ndim == 1 and teacher_sigmas.ndim == 1
+    T = len(teacher_sigmas) - 1
+    assert T >= 1
+    # terminal edge: last k with sigma_t > 0 and sigma_{k+1} == 0
+    terminal_k = None
+    for k in range(T - 1, -1, -1):
+        if teacher_sigmas[k] > 0 and teacher_sigmas[k + 1] == 0:
+            terminal_k = k
+            break
+    if terminal_k is None:
+        terminal_k = T - 1  # fallback
+
+    student_interior = student_sigmas[1:-1]  # exclude sigma_max and 0
+    kept = []
+    for k in range(T):
+        sigma_k = teacher_sigmas[k]
+        if k == 0 or k == terminal_k:
+            kept.append(k)
+            continue
+        # drop if matches any interior student sigma (relative tolerance)
+        match = False
+        for s in student_interior:
+            if torch.isclose(
+                sigma_k,
+                s,
+                rtol=eps,
+                atol=eps * max(1.0, float(abs(sigma_k)), float(abs(s))),
+            ):
+                match = True
+                break
+        if match:
+            continue
+        kept.append(k)
+    return torch.tensor(kept, dtype=torch.long, device=teacher_sigmas.device), int(terminal_k)
+
+
 def partition_edges_by_sigma(student_sigmas: torch.Tensor, teacher_sigmas: torch.Tensor) -> torch.Tensor:
     """
     Sigma-anchored segmentation: segment j collects all teacher edges whose upper sigma
@@ -126,6 +176,7 @@ def sample_segment_and_teacher_pair(
     generator: torch.Generator = None,
     anchor_by_sigma: bool = True,
     sigma_bounds: torch.Tensor = None,
+    terminal_k: int = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
@@ -215,7 +266,9 @@ def sample_segment_and_teacher_pair(
     sigma_bdry = student_sigmas[step_j + 1]
 
     # Classification flags
-    is_terminal = (step_j == (S - 1)) & (k_t == (T - 1))
+    if terminal_k is None:
+        terminal_k = T - 1
+    is_terminal = (step_j == (S - 1)) & (k_t == terminal_k)
     is_boundary_snap = (~is_terminal) & (n_rel == 1) & (step_j < (S - 1))
 
     return {
