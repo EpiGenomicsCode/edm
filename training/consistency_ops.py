@@ -36,7 +36,7 @@ def make_karras_sigmas(
 
 def partition_edges_into_segments(T: int, S: int) -> torch.Tensor:
     """
-    Student-anchored segment boundaries for consistency distillation.
+    Student-anchored segment boundaries for consistency distillation (index-based).
     
     Returns boundaries[j] = round(j * T / S) with ties going up,
     for j in {0, ..., S}, as a LongTensor of shape (S+1,).
@@ -47,7 +47,7 @@ def partition_edges_into_segments(T: int, S: int) -> torch.Tensor:
     - boundaries strictly increasing
     - all segments non-empty
     
-    Each segment j spans teacher edges [boundaries[j], boundaries[j+1]).
+    Each segment j spans teacher edges [boundaries[j], boundaries[j+1}).
     """
     assert T >= 1 and S >= 1, "T and S must be >= 1"
     assert S <= T, f"S ({S}) must be <= T ({T})"
@@ -75,6 +75,48 @@ def partition_edges_into_segments(T: int, S: int) -> torch.Tensor:
     return kb
 
 
+def partition_edges_by_sigma(student_sigmas: torch.Tensor, teacher_sigmas: torch.Tensor) -> torch.Tensor:
+    """
+    Sigma-anchored segmentation: segment j collects all teacher edges whose upper sigma
+    lies in (sigma_s[j+1], sigma_s[j]].
+    
+    Args:
+        student_sigmas: Float tensor shape (S+1,) descending, terminal 0
+        teacher_sigmas: Float tensor shape (T+1,) descending, terminal 0
+    Returns:
+        bounds: LongTensor of shape (S, 2) with [k_start, k_end] inclusive per segment.
+                Each segment is contiguous in teacher index space.
+                If a segment would be empty (no teacher edges in that sigma range),
+                we fall back to the nearest teacher index to the lower boundary.
+    """
+    assert student_sigmas.ndim == 1 and teacher_sigmas.ndim == 1
+    S = len(student_sigmas) - 1
+    T = len(teacher_sigmas) - 1
+    bounds = []
+    # ensure descending
+    if not torch.all(student_sigmas[:-1] >= student_sigmas[1:]):
+        raise AssertionError("student_sigmas must be descending")
+    if not torch.all(teacher_sigmas[:-1] >= teacher_sigmas[1:]):
+        raise AssertionError("teacher_sigmas must be descending")
+    for j in range(S):
+        upper = student_sigmas[j]
+        lower = student_sigmas[j + 1]
+        # teacher edges are indexed by their upper sigma teacher_sigmas[k]
+        mask = (teacher_sigmas[:-1] <= upper) & (teacher_sigmas[:-1] > lower)
+        idx = mask.nonzero(as_tuple=False).view(-1)
+        if len(idx) == 0:
+            # Fallback: pick the nearest teacher index to the lower boundary
+            # (in value space) to avoid empty segment.
+            diffs = (teacher_sigmas[:-1] - lower).abs()
+            k_near = int(torch.argmin(diffs).item())
+            bounds.append((k_near, k_near))
+        else:
+            k_start = int(idx.min().item())
+            k_end = int(idx.max().item())
+            bounds.append((k_start, k_end))
+    return torch.tensor(bounds, dtype=torch.long, device=student_sigmas.device)
+
+
 def sample_segment_and_teacher_pair(
     boundaries: torch.Tensor,
     teacher_sigmas: torch.Tensor,
@@ -82,6 +124,8 @@ def sample_segment_and_teacher_pair(
     batch_size: int,
     device: torch.device,
     generator: torch.Generator = None,
+    anchor_by_sigma: bool = True,
+    sigma_bounds: torch.Tensor = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
@@ -111,6 +155,11 @@ def sample_segment_and_teacher_pair(
         - terminal: k_s == T (σ_s = 0)
         - boundary_snap: first edge in segment (n_rel == 1), not last segment, not terminal
         - general interior: all other edges
+
+    If anchor_by_sigma is True, segments are defined in sigma-space using sigma_bounds
+    (precomputed via partition_edges_by_sigma). Segment lengths may differ. n_rel=1
+    corresponds to the teacher edge closest to the student boundary (lowest sigma in
+    the segment), except for the terminal segment where terminal edges are flagged.
     
     Note: Changing batch_size from 1 to N alters RNG consumption (N independent draws per call
     vs 1 draw per call), which affects reproducibility vs legacy single-edge-per-batch behavior.
@@ -121,33 +170,44 @@ def sample_segment_and_teacher_pair(
     boundaries = boundaries.to(device)
     
     # Sample segment j uniformly from {0, ..., S-1}
-    step_j = torch.randint(
-        low=0,
-        high=S,
-        size=(batch_size,),
-        device=device,
-        dtype=torch.long,
-        generator=generator,
-    )
-    
-    # Get segment lengths
-    seg_len = boundaries[1:] - boundaries[:-1]  # shape (S,)
-    seg_len_j = seg_len[step_j]  # shape (batch_size,)
-    
-    # Sample relative index n_rel in {1, ..., seg_len[j]} uniformly per segment
-    u = torch.empty(batch_size, device=device, dtype=torch.float32)
-    if generator is not None:
-        u.uniform_(0.0, 1.0, generator=generator)
+    step_j = torch.randint(low=0, high=S, size=(batch_size,), device=device, dtype=torch.long, generator=generator)
+
+    if anchor_by_sigma:
+        assert sigma_bounds is not None and sigma_bounds.shape == (S, 2)
+        sigma_bounds = sigma_bounds.to(device)
+        k0 = sigma_bounds[step_j, 0]
+        k1 = sigma_bounds[step_j, 1]
+        seg_len_j = (k1 - k0 + 1).clamp(min=1)
+
+        # Sample n_rel uniformly in {1, ..., seg_len_j}
+        u = torch.empty(batch_size, device=device, dtype=torch.float32)
+        if generator is not None:
+            u.uniform_(0.0, 1.0, generator=generator)
+        else:
+            u.uniform_(0.0, 1.0)
+        n_rel = torch.floor(u * seg_len_j.float() + 1.0).to(torch.long)
+        n_rel = torch.minimum(n_rel, seg_len_j)
+
+        # n_rel = 1 → closest to boundary (lowest sigma in segment) → k_t = k1
+        k_t = k1 - (n_rel - 1)
+        k_s = (k_t + 1).clamp(max=T)  # guard, though k_t<T by construction
     else:
-        u.uniform_(0.0, 1.0)
-    
-    n_rel = torch.floor(u * seg_len_j.float() + 1.0).to(torch.long)
-    n_rel = torch.clamp(n_rel, min=1)
-    n_rel = torch.minimum(n_rel, seg_len_j)
-    
-    # Compute teacher-adjacent indices
-    k_t = boundaries[step_j] + (n_rel - 1)
-    k_s = k_t + 1
+        # Index-anchored (original MSCD) segmentation.
+        seg_len = boundaries[1:] - boundaries[:-1]  # shape (S,)
+        seg_len_j = seg_len[step_j]  # shape (batch_size,)
+
+        u = torch.empty(batch_size, device=device, dtype=torch.float32)
+        if generator is not None:
+            u.uniform_(0.0, 1.0, generator=generator)
+        else:
+            u.uniform_(0.0, 1.0)
+
+        n_rel = torch.floor(u * seg_len_j.float() + 1.0).to(torch.long)
+        n_rel = torch.clamp(n_rel, min=1)
+        n_rel = torch.minimum(n_rel, seg_len_j)
+
+        k_t = boundaries[step_j] + (n_rel - 1)
+        k_s = k_t + 1
 
     # Gather sigmas
     sigma_t = teacher_sigmas[k_t]
@@ -155,10 +215,8 @@ def sample_segment_and_teacher_pair(
     sigma_bdry = student_sigmas[step_j + 1]
 
     # Classification flags
-    S = len(boundaries) - 1
-    T = len(teacher_sigmas) - 1
-    is_terminal = (k_s == T)  # σ_s = 0
-    is_boundary_snap = (n_rel == 1) & (step_j < (S - 1)) & (~is_terminal)
+    is_terminal = (step_j == (S - 1)) & (k_t == (T - 1))
+    is_boundary_snap = (~is_terminal) & (n_rel == 1) & (step_j < (S - 1))
 
     return {
         "step_j": step_j,

@@ -11,6 +11,7 @@ from torch_utils import training_stats
 from .consistency_ops import (
     make_karras_sigmas,
     partition_edges_into_segments,
+    partition_edges_by_sigma,
     sample_segment_and_teacher_pair,
     heun_hop_edm_stochastic,
     inv_ddim_edm,
@@ -91,16 +92,17 @@ class EDMConsistencyDistillLoss:
         S_min: float = 0.05,
         S_max: float = 50.0,
         S_noise: float = 1.003,
-        loss_type: str = "huber",    # "huber" | "l2"
+        loss_type: str = "huber",    # "huber" | "l2" (squared) | "l2_root" (euclidean)
         weight_mode: str = "edm",    # "edm" | "vlike" | "flat" | "snr" | "snr+1" | "karras" | "truncated-snr" | "uniform"
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
         target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA or teacher)
+        anchor_by_sigma: bool = True,   # If True, segment teacher edges in sigma-space (closest-to-boundary first)
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
-        assert loss_type in ("huber", "l2")
+        assert loss_type in ("huber", "l2", "l2_root")
         assert weight_mode in (
             "edm",
             "vlike",
@@ -135,6 +137,7 @@ class EDMConsistencyDistillLoss:
         # - EMA copy of student: stabilizes training (OpenAI's approach, rate=0.95)
         # - Frozen teacher: for debugging
         self.target_net = target_net
+        self.anchor_by_sigma = bool(anchor_by_sigma)
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -318,6 +321,9 @@ class EDMConsistencyDistillLoss:
 
         # Partition teacher edges into S segments.
         boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
+        sigma_bounds = None
+        if self.anchor_by_sigma:
+            sigma_bounds = partition_edges_by_sigma(student_sigmas=student_sigmas, teacher_sigmas=teacher_sigmas)
 
         # Sample per-sample edges: each element in batch gets independent (j, k_t, k_s, sigmas).
         sample_dict = sample_segment_and_teacher_pair(
@@ -326,6 +332,8 @@ class EDMConsistencyDistillLoss:
             student_sigmas=student_sigmas,
             batch_size=batch_size,         # per-sample sampling (PRD §4.2.1)
             device=device,
+            anchor_by_sigma=self.anchor_by_sigma,
+            sigma_bounds=sigma_bounds,
         )
         
         # Extract per-sample vectors (all shape [N])
@@ -484,9 +492,17 @@ class EDMConsistencyDistillLoss:
         diff = x_hat_t - x_hat_t_star
         if self.loss_type == "huber":
             per_elem = _huber_loss(diff)
+            loss = weight * per_elem
+        elif self.loss_type == "l2_root":
+            # Euclidean (L2) distance across all channels/pixels per sample.
+            # Produce shape [N,1,1,1] to keep reporting semantics.
+            per_sample = torch.sqrt(torch.clamp((diff * diff).sum(dim=[1, 2, 3]), min=1e-12))
+            per_elem = per_sample.view(batch_size, 1, 1, 1)
+            loss = weight * per_elem  # weight broadcast per sample
         else:
+            # "l2": elementwise squared error (matches prior behavior)
             per_elem = diff * diff
-        loss = weight * per_elem
+            loss = weight * per_elem
 
         # Update edge statistics (per-sample counts) (PRD §4.2.8)
         num_terminal = int(is_terminal.sum().item())
@@ -849,9 +865,14 @@ class EDMConsistencyDistillLoss:
             diff = x_hat_t - x_hat_t_star
             if self.loss_type == "huber":
                 per_elem = _huber_loss(diff)
+                loss = weight * per_elem
+            elif self.loss_type == "l2_root":
+                per_sample = torch.sqrt(torch.clamp((diff * diff).sum(dim=[1, 2, 3]), min=1e-12))
+                per_elem = per_sample.view(-1, 1, 1, 1)
+                loss = weight * per_elem
             else:
                 per_elem = diff * diff
-            loss = weight * per_elem
+                loss = weight * per_elem
             
             # Finiteness checks
             check_finite(x_t, "x_t", sigma_t_val, sigma_s_val, sigma_bdry_val)
@@ -1046,9 +1067,14 @@ class EDMConsistencyDistillLoss:
                 diff = x_hat_t - x_hat_t_star
                 if self.loss_type == "huber":
                     per_elem = _huber_loss(diff)
+                    loss_self = weight * per_elem
+                elif self.loss_type == "l2_root":
+                    per_sample = torch.sqrt(torch.clamp((diff * diff).sum(dim=[1, 2, 3]), min=1e-12))
+                    per_elem = per_sample.view(-1, 1, 1, 1)
+                    loss_self = weight * per_elem
                 else:
                     per_elem = diff * diff
-                loss_self = weight * per_elem
+                    loss_self = weight * per_elem
                 
                 self_loss_mean = float(loss_self.mean().cpu())
                 rms_self_diff = rms(x_hat_t - x_hat_t_star)
