@@ -490,12 +490,28 @@ class EDMConsistencyDistillLoss:
         gain = 1.0 / torch.clamp(1.0 - ratio_ref, min=1e-6)  # [N]
 
         # Compute inv-DDIM target at t using per-sample sigma_ref (PRD §4.2.6)
-        x_hat_t_star = inv_ddim_edm(
-            x_ref=x_ref_bdry,
-            x_t=x_t,
-            sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
-            sigma_ref=sigma_ref_vec,  # [N]
-        ).to(torch.float32)
+        try:
+            x_hat_t_star = inv_ddim_edm(
+                x_ref=x_ref_bdry,
+                x_t=x_t,
+                sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
+                sigma_ref=sigma_ref_vec,  # [N]
+            ).to(torch.float32)
+        except ValueError as e:
+            # Add sampling context to the error message
+            error_msg = str(e) + "\n\n  Sampling context for affected samples (first 5):\n"
+            bad_idx = (torch.abs(sigma_ref_vec - sigma_t_vec) < 1e-8).nonzero(as_tuple=False).view(-1)[:5]
+            for idx in bad_idx:
+                i = int(idx.item())
+                error_msg += (
+                    f"    Sample {i}: seg_j={j[i].item()}, n_rel={n_rel[i].item()}, "
+                    f"terminal={is_terminal[i].item()}, boundary_snap={is_boundary_snap[i].item()}\n"
+                    f"              sigma_t={sigma_t_vec[i].item():.9f}, "
+                    f"sigma_s_eff={sigma_s_eff[i].item():.9f}, "
+                    f"sigma_bdry={sigma_bdry_vec[i].item():.9f}, "
+                    f"sigma_ref={sigma_ref_vec[i].item():.9f}\n"
+                )
+            raise ValueError(error_msg) from e
 
         # Student prediction at t (PRD §4.2.7)
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)

@@ -356,11 +356,29 @@ def inv_ddim_edm(
     sigma_ref_b = _expand_sigma_to_bchw(sigma_ref, x_t32)
     # Guards: avoid division by zero or degenerate denominator (σ_ref == σ_t).
     if torch.any(sigma_t_b == 0):
-        raise ValueError("inv_ddim_edm received sigma_t == 0. Avoid σ=0 when backsolving.")
+        bad_idx = (sigma_t_b == 0).nonzero(as_tuple=False)[:, 0].unique()
+        sigma_t_flat = sigma_t if sigma_t.ndim <= 1 else sigma_t_b[:, 0, 0, 0]
+        bad_vals = [(int(i.item()), float(sigma_t_flat[i].item())) for i in bad_idx[:5]]
+        raise ValueError(
+            f"inv_ddim_edm received sigma_t == 0. Avoid σ=0 when backsolving.\n"
+            f"  Affected samples (first 5): {bad_vals}"
+        )
     ratio = sigma_ref_b / sigma_t_b
     denom = 1.0 - ratio
-    if torch.any(denom == 0):
-        raise ValueError("inv_ddim_edm denominator is zero (σ_ref == σ_t). Drop or resample this pair.")
+    if torch.any(denom.abs() < 1e-8):
+        bad_idx = (denom.abs() < 1e-8).nonzero(as_tuple=False)[:, 0].unique()
+        sigma_t_flat = sigma_t if sigma_t.ndim <= 1 else sigma_t_b[:, 0, 0, 0]
+        sigma_ref_flat = sigma_ref if sigma_ref.ndim <= 1 else sigma_ref_b[:, 0, 0, 0]
+        bad_vals = [
+            (int(i.item()), float(sigma_t_flat[i].item()), float(sigma_ref_flat[i].item()))
+            for i in bad_idx[:5]
+        ]
+        raise ValueError(
+            f"inv_ddim_edm denominator is zero (σ_ref ≈ σ_t). Drop or resample this pair.\n"
+            f"  Affected samples (first 5, format: [idx, sigma_t, sigma_ref]):\n"
+            f"    {bad_vals}\n"
+            f"  This indicates sigma_ref and sigma_t are nearly equal, making the invDDIM formula degenerate."
+        )
     x_hat_star_t = (x_ref32 - ratio * x_t32) / denom
     return x_hat_star_t.to(out_dtype)
 
