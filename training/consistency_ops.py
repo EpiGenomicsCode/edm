@@ -431,3 +431,21 @@ def heun_hop_edm(
     return x_s.to(out_dtype)
 
 
+# Backward compatibility alias for old checkpoints
+@torch.no_grad()
+def heun_hop_edm_stochastic(
+    net,
+    x_t: torch.Tensor,
+    sigma_t: torch.Tensor,
+    sigma_s: torch.Tensor,
+    class_labels: torch.Tensor = None,
+    augment_labels: torch.Tensor = None,
+    **kwargs  # Ignore any churn parameters from old code
+) -> torch.Tensor:
+    """
+    Backward compatibility wrapper for old checkpoints.
+    Now just calls deterministic heun_hop_edm (churn removed).
+    """
+    return heun_hop_edm(net, x_t, sigma_t, sigma_s, class_labels, augment_labels)
+
+
