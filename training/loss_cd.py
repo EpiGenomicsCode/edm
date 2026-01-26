@@ -415,10 +415,10 @@ class EDMConsistencyDistillLoss:
                 for idx in bad_idx:
                     i = int(idx.item())
                     msg += (
-                        f\"  i={i} j={int(j[i].item())} n_rel={int(n_rel[i].item())} \"
-                        f\"terminal={bool(is_terminal[i].item())} boundary_snap={bool(is_boundary_snap[i].item())} \"
-                        f\"sigma_t={float(sigma_t_vec[i].item()):.12g} sigma_ref={float(sigma_ref_screen[i].item()):.12g} \"
-                        f\"denom_f32={float(denom_f32[i].item()):.3e}\\n\"
+                        f"  i={i} j={int(j[i].item())} n_rel={int(n_rel[i].item())} "
+                        f"terminal={bool(is_terminal[i].item())} boundary_snap={bool(is_boundary_snap[i].item())} "
+                        f"sigma_t={float(sigma_t_vec[i].item()):.12g} sigma_ref={float(sigma_ref_screen[i].item()):.12g} "
+                        f"denom_f32={float(denom_f32[i].item()):.3e}\n"
                     )
                 raise RuntimeError(msg)
 
