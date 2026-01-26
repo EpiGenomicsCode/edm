@@ -355,8 +355,93 @@ class EDMConsistencyDistillLoss:
             sigma_bounds=sigma_bounds,
             terminal_k=terminal_k,
         )
+
+        # -------------------------------------------------------------------------------------
+        # Option A: Resample only degenerate edges (invDDIM requires σ_ref < σ_t).
+        #
+        # We pre-screen (σ_t, σ_ref) pairs *before* sampling noise x_t so that any resampled
+        # elements get a consistent x_t drawn for their new σ_t.
+        #
+        # Degeneracy criterion: denom = 1 - (σ_ref/σ_t) ~ 0 when computed in float32,
+        # matching inv_ddim_edm's guard. This catches cases like σ_ref≈σ_t at σ_min
+        # due to rounding/device math.
+        # -------------------------------------------------------------------------------------
+        resample_total = 0
+        resample_rounds = 0
+        denom_eps = 1e-8
+        max_rounds = 8  # hard stop to avoid infinite loops if something is fundamentally broken
+
+        while True:
+            # Extract the per-sample vectors needed for screening.
+            j = sample_dict["step_j"].long()               # [N]
+            n_rel = sample_dict["n_rel"].long()            # [N]
+            sigma_t_vec = sample_dict["sigma_t"]           # [N]
+            sigma_s_teacher_vec = sample_dict["sigma_s"]   # [N]
+            sigma_bdry_vec = sample_dict["sigma_bdry"]     # [N]
+            is_terminal = sample_dict["is_terminal"].bool()
+            is_boundary_snap = sample_dict["is_boundary_snap"].bool()
+
+            # Compute σ_s_eff as in MSCD rules (needed because boundary-snap uses σ_ref=σ_s_eff).
+            sigma_s_eff_screen = sigma_s_teacher_vec.clone()
+            sigma_s_eff_screen = torch.where(is_boundary_snap, sigma_bdry_vec, sigma_s_eff_screen)
+            is_general_screen = (~is_terminal) & (~is_boundary_snap)
+            sigma_s_eff_screen = torch.where(
+                is_general_screen,
+                torch.maximum(sigma_s_teacher_vec, sigma_bdry_vec),
+                sigma_s_eff_screen,
+            )
+
+            # Compute σ_ref for screening (exactly as used later):
+            # - terminal: 0
+            # - boundary snap: σ_s_eff (= σ_bdry)
+            # - general: σ_bdry
+            sigma_ref_screen = torch.where(is_terminal, torch.zeros_like(sigma_t_vec), sigma_bdry_vec)
+            sigma_ref_screen = torch.where(is_boundary_snap, sigma_s_eff_screen, sigma_ref_screen)
+
+            # Degeneracy check in float32 (mirrors inv_ddim_edm/_expand_sigma_to_bchw behavior).
+            denom_f32 = 1.0 - (sigma_ref_screen.to(torch.float32) / torch.clamp(sigma_t_vec.to(torch.float32), min=1e-12))
+            bad = denom_f32.abs() < denom_eps
+
+            if not torch.any(bad):
+                # keep the screened values so we don't recompute immediately after the loop
+                sigma_s_eff = sigma_s_eff_screen
+                break
+
+            resample_rounds += 1
+            if resample_rounds > max_rounds:
+                # Provide context so we can diagnose if this ever happens.
+                bad_idx = bad.nonzero(as_tuple=False).view(-1)[:10]
+                msg = f"[CD] Too many resampling rounds ({resample_rounds}) while avoiding σ_ref≈σ_t.\\n"
+                for idx in bad_idx:
+                    i = int(idx.item())
+                    msg += (
+                        f\"  i={i} j={int(j[i].item())} n_rel={int(n_rel[i].item())} \"
+                        f\"terminal={bool(is_terminal[i].item())} boundary_snap={bool(is_boundary_snap[i].item())} \"
+                        f\"sigma_t={float(sigma_t_vec[i].item()):.12g} sigma_ref={float(sigma_ref_screen[i].item()):.12g} \"
+                        f\"denom_f32={float(denom_f32[i].item()):.3e}\\n\"
+                    )
+                raise RuntimeError(msg)
+
+            bad_idx = bad.nonzero(as_tuple=False).view(-1)
+            n_bad = int(bad_idx.numel())
+            resample_total += n_bad
+
+            # Resample only the degenerate batch elements.
+            new_samples = sample_segment_and_teacher_pair(
+                boundaries=boundaries,
+                teacher_sigmas=teacher_sigmas,
+                student_sigmas=student_sigmas,
+                batch_size=n_bad,
+                device=device,
+                anchor_by_sigma=self.anchor_by_sigma,
+                sigma_bounds=sigma_bounds,
+                terminal_k=terminal_k,
+            )
+            for k, v in new_samples.items():
+                sample_dict[k][bad_idx] = v
         
-        # Extract per-sample vectors (all shape [N])
+        # Extract per-sample vectors (all shape [N]) after any resampling.
+        # Note: sigma_s_eff was computed in the screening loop for the final sample_dict.
         j = sample_dict["step_j"].long()               # [N]
         n_rel = sample_dict["n_rel"].long()            # [N]
         sigma_t_vec = sample_dict["sigma_t"]           # [N]
@@ -364,28 +449,13 @@ class EDMConsistencyDistillLoss:
         sigma_bdry_vec = sample_dict["sigma_bdry"]     # [N]
         is_terminal = sample_dict["is_terminal"].bool()        # [N]
         is_boundary_snap = sample_dict["is_boundary_snap"].bool()  # [N]
-
-        # Vectorized MSCD sigma_s refinement (PRD §4.2.2)
-        # Apply per-element MSCD rules:
-        # - Terminal: keep sigma_s_eff = sigma_s_teacher_vec (already 0)
-        # - Boundary snap: sigma_s_eff = sigma_bdry_vec
-        # - General interior: sigma_s_eff = max(sigma_s_teacher_vec, sigma_bdry_vec)
-        sigma_s_eff = sigma_s_teacher_vec.clone()
-        
-        # Boundary snap override
-        sigma_s_eff = torch.where(
-            is_boundary_snap,
-            sigma_bdry_vec,
-            sigma_s_eff,
-        )
-        
-        # General interior: max(sigma_s_teacher, sigma_bdry)
         is_general = (~is_terminal) & (~is_boundary_snap)
-        sigma_s_eff = torch.where(
-            is_general,
-            torch.maximum(sigma_s_teacher_vec, sigma_bdry_vec),
-            sigma_s_eff,
-        )
+
+        # Report resampling stats (shows up in W&B via training_stats).
+        if self.enable_stats:
+            training_stats.report('CD/resample_edges', torch.as_tensor(float(resample_total), device=device))
+            training_stats.report('CD/resample_frac', torch.as_tensor(float(resample_total) / float(batch_size), device=device))
+            training_stats.report('CD/resample_rounds', torch.as_tensor(float(resample_rounds), device=device))
 
         # Broadcast per-sample sigmas to [N,1,1,1] for BCHW operations (PRD §4.2.3).
         #   - sigma_t_vec / sigma_s_eff / sigma_bdry_vec come from Karras grids and are float64 by default.
