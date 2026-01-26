@@ -281,9 +281,12 @@ def sample_segment_and_teacher_pair(
     sigma_bdry = student_sigmas[step_j + 1]
 
     # Classification flags
+    # The terminal edge (k_t == terminal_k) should ALWAYS be treated as terminal,
+    # even if the fallback in partition_edges_by_sigma assigned it to a non-terminal segment.
+    # This prevents the degenerate case where sigma_t ≈ sigma_bdry ≈ sigma_min.
     if terminal_k is None:
         terminal_k = T - 1
-    is_terminal = (step_j == (S - 1)) & (k_t == terminal_k)
+    is_terminal = (k_t == terminal_k)  # Terminal whenever we hit the terminal edge
     is_boundary_snap = (~is_terminal) & (n_rel == 1) & (step_j < (S - 1))
 
     return {
