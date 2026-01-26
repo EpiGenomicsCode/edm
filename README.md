@@ -55,6 +55,10 @@ python fid.py calc --images=samples --ref=fid-refs/imagenet-64x64.npz
 | Parameterization | ε-prediction | EDM preconditioning |
 | Segmentation | Index-based | Sigma-anchored |
 
+## Documentation
+
+For a detailed explanation of the mathematics, including the invDDIM formulation, sigma-anchored segmentation, and the translation from VP to EDM, see the **[Technical Report](docs/technical-report.pdf)**.
+
 ## Key Files
 
 - `train.py` — main training script with CD options
