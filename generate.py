@@ -17,7 +17,47 @@ import numpy as np
 import torch
 import PIL.Image
 import dnnlib
-from torch_utils import distributed as dist
+from torch_utils import distributed as dist, persistence, misc
+
+
+#----------------------------------------------------------------------------
+# Persistence import hook to make training snapshots robust to relative imports.
+# This mirrors the logic used in the debug harness so that checkpoints that
+# include modules like training.loss_cd and torch_utils.* can be loaded
+# without `attempted relative import with no known parent package` errors.
+
+@persistence.import_hook
+def _fix_relative_imports(meta: dnnlib.EasyDict) -> dnnlib.EasyDict:
+    src = meta.module_src
+
+    # training.loss_cd: relative import -> absolute
+    src = src.replace(
+        "from .consistency_ops import (",
+        "from training.consistency_ops import (",
+    )
+
+    # torch_utils.*: relative imports -> absolute
+    src = src.replace(
+        "from . import distributed as dist",
+        "from torch_utils import distributed as dist",
+    )
+    src = src.replace(
+        "from . import training_stats",
+        "from torch_utils import training_stats",
+    )
+    src = src.replace(
+        "from . import misc",
+        "from torch_utils import misc",
+    )
+
+    # dnnlib.__init__: relative import -> absolute
+    src = src.replace(
+        "from .util import EasyDict, make_cache_dir_path",
+        "from dnnlib.util import EasyDict, make_cache_dir_path",
+    )
+
+    meta.module_src = src
+    return meta
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -214,7 +254,7 @@ def parse_int_list(s):
 #----------------------------------------------------------------------------
 
 @click.command()
-@click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
+@click.option('--network', 'network_pkl',  help='Network pickle filename (EMA snapshot); required if --state is not set', metavar='PATH|URL', type=str, required=False, default=None)
 @click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
 @click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
@@ -234,8 +274,8 @@ def parse_int_list(s):
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
-
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+@click.option('--state', 'state_path',     help='Optional training-state-*.pt to load raw (non-EMA) weights',        metavar='PATH', type=str, default=None)
+def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, state_path, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -260,10 +300,26 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     if dist.get_rank() != 0:
         torch.distributed.barrier()
 
-    # Load network.
-    dist.print0(f'Loading network from "{network_pkl}"...')
-    with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-        net = pickle.load(f)['ema'].to(device)
+    # Load network:
+    # - If state_path is given, use the raw training net from training-state-*.pt (no EMA at all).
+    # - Otherwise, fall back to EMA from snapshot for standard generation.
+    if state_path is not None:
+        dist.print0(f'Loading raw training weights from "{state_path}" (ignoring EMA)...')
+        state = torch.load(state_path, map_location=torch.device('cpu'))
+        if 'net' not in state:
+            raise KeyError(f'"{state_path}" does not contain a \'net\' entry (expected raw training network).')
+        net = state['net'].to(device)
+        net.eval().requires_grad_(False)
+    else:
+        if network_pkl is None:
+            raise click.ClickException("Missing required option '--network' when --state is not provided.")
+        dist.print0(f'Loading network (EMA) from "{network_pkl}"...')
+        with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
+            snapshot_data = pickle.load(f)
+        if 'ema' not in snapshot_data:
+            raise KeyError(f'"{network_pkl}" does not contain an EMA network (expected key \'ema\').')
+        net = snapshot_data['ema'].to(device)
+        net.eval().requires_grad_(False)
 
     # Other ranks follow.
     if dist.get_rank() == 0:

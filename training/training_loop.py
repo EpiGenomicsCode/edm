@@ -53,6 +53,8 @@ def training_loop(
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
     validation_kwargs   = None,     # Validation configuration (PRD-04).
+    cd_target_mode      = 'live',   # Target network mode for CD sigma_s denoiser: 'live' | 'ema' | 'teacher'.
+    cd_target_ema       = 0.95,     # EMA rate for target network (only used if cd_target_mode='ema').
 ):
     # Initialize.
     start_time = time.time()
@@ -93,11 +95,34 @@ def training_loop(
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    # Disable broadcast_buffers since we only use GroupNorm (no running stats).
-    # Leave static_graph at its default (False) to avoid the reducer expect_autograd_hooks_
-    # assertions we are seeing with this particular PyTorch build.
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
+    # DDP configuration:
+    # - Disable broadcast_buffers since we only use GroupNorm (no running stats).
+    # - Disable gradient_as_bucket_view to avoid rare reducer bucket bugs
+    #   observed with this PyTorch/NCCL combination (negative-dimension tensors
+    #   when rebuilding buckets).
+    # - Keep static_graph=False because enabling it with this CD graph +
+    #   PyTorch build has been observed to trigger internal
+    #   expect_autograd_hooks_ assertions in the reducer.
+    # - Enable find_unused_parameters=True as a conservative setting so that
+    #   the reducer tolerates any parameters that might not participate in the
+    #   backward graph on a given iteration (even though we expect the graph to
+    #   be effectively fixed in practice).
+    ddp = torch.nn.parallel.DistributedDataParallel(
+        net,
+        device_ids=[device],
+        broadcast_buffers=False,
+        gradient_as_bucket_view=False,
+        static_graph=False,
+        find_unused_parameters=True,
+    )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
+    
+    # Initialize target network for CD sigma_s denoiser (OpenAI CM style).
+    # This is separate from the validation EMA and is used during training.
+    target_ema_net = None
+    if hasattr(loss_fn, 'teacher_net') and cd_target_mode == 'ema':
+        target_ema_net = copy.deepcopy(net).eval().requires_grad_(False)
+        dist.print0(f'[CD TARGET] Initialized target EMA network with rate={cd_target_ema}')
     
     # Seed student from teacher AFTER DDP wrapping (if CD mode and shapes match).
     # This avoids NCCL desync issues during DDP initialization.
@@ -124,6 +149,9 @@ def training_loop(
                 misc.copy_params_and_buffers(src_module=teacher, dst_module=net, require_all=False)
                 # Also update EMA to start from teacher weights.
                 misc.copy_params_and_buffers(src_module=teacher, dst_module=ema, require_all=False)
+                # Also update target EMA if it exists.
+                if target_ema_net is not None:
+                    misc.copy_params_and_buffers(src_module=teacher, dst_module=target_ema_net, require_all=False)
                 if dist.get_rank() == 0:
                     dist.print0('[CD INIT] Seeded student & EMA from teacher (all parameter/buffer shapes match).')
             else:
@@ -132,6 +160,21 @@ def training_loop(
         except Exception as _e:
             if dist.get_rank() == 0:
                 dist.print0(f'[CD INIT] Failed to seed from teacher: {_e}')
+    
+    # Configure the loss function's target network based on cd_target_mode.
+    if hasattr(loss_fn, 'set_target_net'):
+        if cd_target_mode == 'live':
+            # No target network; loss will use live student weights (default behavior).
+            loss_fn.set_target_net(None)
+        elif cd_target_mode == 'ema':
+            # Use the target EMA network.
+            loss_fn.set_target_net(target_ema_net)
+        elif cd_target_mode == 'teacher':
+            # Use the frozen teacher for sigma_s denoiser.
+            loss_fn.set_target_net(loss_fn.teacher_net)
+            dist.print0('[CD TARGET] Using frozen teacher for sigma_s denoiser.')
+        else:
+            raise ValueError(f'Unknown cd_target_mode: {cd_target_mode}')
 
     # Optional W&B initialization (async/threaded).
     wandb_run = None
@@ -184,6 +227,10 @@ def training_loop(
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
+        # Load target_ema if it was saved and we're using it.
+        if target_ema_net is not None and 'target_ema' in data:
+            misc.copy_params_and_buffers(src_module=data['target_ema'], dst_module=target_ema_net, require_all=True)
+            dist.print0('[CD TARGET] Loaded target EMA from training state.')
         del data # conserve memory
 
     # Broadcast run_dir to all ranks (rank 0 has it, others have None).
@@ -265,9 +312,13 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
+    step_stats_jsonl = None
+    cur_step = 0
     ema_updates = 0
     last_loss_scalar = None
     while True:
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] loop iter start: cur_nimg={cur_nimg}', flush=True)
 
         # Make teacher annealing resume-aware by exposing global kimg to the loss.
         try:
@@ -277,15 +328,27 @@ def training_loop(
             pass
 
         # Accumulate gradients.
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] zero_grad', flush=True)
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] round {round_idx}: fetching batch', flush=True)
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: batch fetched, moving to device', flush=True)
                 images = images.to(device).to(torch.float32) / 127.5 - 1
                 labels = labels.to(device)
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: calling loss_fn', flush=True)
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: loss computed, calling backward', flush=True)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                if os.environ.get('CD_DDP_DEBUG'):
+                    print(f'[RANK {dist.get_rank()}] round {round_idx}: backward done', flush=True)
                 try:
                     last_loss_scalar = float(loss.mean().detach().cpu().item())
                 except Exception:
@@ -294,12 +357,86 @@ def training_loop(
         # Update weights.
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+        # Capture the effective LR for this step (assume a single scalar LR across params).
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Sanitize gradients and compute global norms (per optimizer step).
+        total_grad_sq = torch.zeros([], device=device)
+        total_param_sq = torch.zeros([], device=device)
         for param in net.parameters():
+            # Accumulate parameter norm regardless of gradient presence.
+            param_norm = param.detach().float().norm(2)
+            total_param_sq = total_param_sq + param_norm * param_norm
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+                grad_norm = param.grad.detach().float().norm(2)
+                total_grad_sq = total_grad_sq + grad_norm * grad_norm
+        grad_global_norm = torch.sqrt(total_grad_sq)
+        param_global_norm = torch.sqrt(total_param_sq)
+        # True update/param ratio, incorporating the current learning rate.
+        true_update_over_param = (current_lr * grad_global_norm) / torch.clamp(param_global_norm, min=1e-12)
+        training_stats.report('Grad/global_norm', grad_global_norm)
+        training_stats.report('Grad/param_norm', param_global_norm)
+        training_stats.report('Grad/update_over_param', true_update_over_param)
         optimizer.step()
+        # Per-optimizer-step diagnostics (rank 0 only, written to step_stats.jsonl and W&B).
+        if dist.get_rank() == 0:
+            if step_stats_jsonl is None and run_dir is not None:
+                step_stats_path = os.path.join(run_dir, 'step_stats.jsonl')
+                step_stats_jsonl = open(step_stats_path, 'at')
+            # Build a per-step metrics payload from loss + optimizer state.
+            step_record = {
+                'step': cur_step,
+                'nimg': int(cur_nimg),
+                'kimg': float(cur_nimg / 1e3),
+                'tick': int(cur_tick),
+                'lr': float(current_lr),
+                'grad_global_norm': float(grad_global_norm.detach().cpu()),
+                'param_global_norm': float(param_global_norm.detach().cpu()),
+                'update_over_param': float(true_update_over_param.detach().cpu()),
+                'loss': float(last_loss_scalar) if last_loss_scalar is not None else None,
+            }
+            if hasattr(loss_fn, '_last_step_metrics') and isinstance(getattr(loss_fn, '_last_step_metrics'), dict):
+                step_record.update(loss_fn._last_step_metrics)
+            # Write to per-step JSONL if available.
+            if step_stats_jsonl is not None:
+                step_stats_jsonl.write(json.dumps(step_record) + '\n')
+                step_stats_jsonl.flush()
+            # Also log per-step metrics to W&B (no tick aggregation).
+            if wandb_run is not None:
+                try:
+                    import wandb as _wandb
+                    wandb_payload = {
+                        'opt_step': step_record['step'],
+                        'kimg': step_record['kimg'],
+                        'Grad/global_norm': step_record['grad_global_norm'],
+                        'Grad/param_norm': step_record['param_global_norm'],
+                        'Grad/update_over_param': step_record['update_over_param'],
+                    }
+                    # Per-step loss (separate from tick-level summary loss).
+                    if step_record['loss'] is not None:
+                        wandb_payload['Loss/loss_step'] = step_record['loss']
+                    # Map cached CD diagnostics (if present) to W&B-friendly names.
+                    cd_map = {
+                        'cd_gain_mean': 'CD/gain_mean',
+                        'cd_gain_max': 'CD/gain_max',
+                        'cd_gain_95p': 'CD/gain_95p',
+                        'cd_gain_99p': 'CD/gain_99p',
+                        'cd_gain_terminal_mean': 'CD/gain_terminal_mean',
+                        'cd_gain_boundary_mean': 'CD/gain_boundary_mean',
+                        'cd_gain_general_mean': 'CD/gain_general_mean',
+                        'cd_loss_mean': 'CD/loss_mean',
+                        'cd_loss_gain_corr': 'CD/loss_gain_corr',
+                    }
+                    for key_src, key_dst in cd_map.items():
+                        if key_src in step_record and step_record[key_src] is not None:
+                            wandb_payload[key_dst] = step_record[key_src]
+                    _wandb.log(wandb_payload, commit=True)
+                except Exception as _e:
+                    dist.print0(f'[W&B] per-step log failed: {_e}')
+        cur_step += 1
 
-        # Update EMA.
+        # Update EMA (validation/snapshot EMA).
         ema_halflife_nimg = ema_halflife_kimg * 1000
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
@@ -307,6 +444,18 @@ def training_loop(
         for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
         ema_updates += 1
+        
+        # Update target EMA (for CD sigma_s denoiser, OpenAI CM style).
+        # This uses a fixed EMA rate (no rampup), matching OpenAI's "fixed" mode.
+        if target_ema_net is not None:
+            target_ema_beta = cd_target_ema  # e.g., 0.95
+            for p_target, p_net in zip(target_ema_net.parameters(), net.parameters()):
+                p_target.mul_(target_ema_beta).add_(p_net.detach(), alpha=1 - target_ema_beta)
+            # Update the loss function's reference to the target network.
+            # (The target_net itself is updated in-place, but we call set_target_net
+            # to ensure the loss function has the correct reference after resume/reload.)
+            if hasattr(loss_fn, 'set_target_net'):
+                loss_fn.set_target_net(target_ema_net)
 
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
@@ -315,6 +464,8 @@ def training_loop(
             continue
 
         # Print status line, accumulating the same information in training_stats.
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] tick end: gathering stats', flush=True)
         tick_end_time = time.time()
         fields = []
         fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
@@ -327,31 +478,17 @@ def training_loop(
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
         fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
         torch.cuda.reset_peak_memory_stats()
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] tick end: printing status', flush=True)
         dist.print0(' '.join(fields))
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] tick end: status printed', flush=True)
 
         # Check for abort.
         if (not done) and dist.should_stop():
             done = True
             dist.print0()
             dist.print0('Aborting...')
-
-        # Save network snapshot.
-        if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
-            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-            for key, value in data.items():
-                if isinstance(value, torch.nn.Module):
-                    value = copy.deepcopy(value).eval().requires_grad_(False)
-                    misc.check_ddp_consistency(value)
-                    data[key] = value.cpu()
-                del value # conserve memory
-            if dist.get_rank() == 0:
-                with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
-                    pickle.dump(data, f)
-            del data # conserve memory
-
-        # Save full dump of the training state.
-        if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
 
         # Update logs.
         training_stats.default_collector.update()
@@ -363,6 +500,7 @@ def training_loop(
             # Optional W&B logging once per tick (async).
             if wandb_run is not None:
                 try:
+                    # Tick-level progress-only logging; detailed metrics are logged per optimizer step.
                     log_dict = dict(
                         progress_kimg=cur_nimg / 1e3,
                         tick=cur_tick,
@@ -375,17 +513,46 @@ def training_loop(
                             log_dict['cd_T_edges'] = int(loss_fn._current_T_edges())
                     except Exception:
                         pass
-                    # Merge detailed training stats.
-                    stats_payload = training_stats.default_collector.as_dict()
-                    if isinstance(stats_payload, dict):
-                        log_dict.update(stats_payload)
+                    # CD edge statistics (non-reset read for W&B)
+                    try:
+                        if hasattr(loss_fn, 'get_edge_stats'):
+                            edge_stats = loss_fn.get_edge_stats(reset=False)
+                            if edge_stats.get('total_edges', 0) > 0:
+                                log_dict['cd_edge/terminal_pct'] = edge_stats['terminal_pct']
+                                log_dict['cd_edge/boundary_match_pct'] = edge_stats['boundary_match_pct']
+                                log_dict['cd_edge/total_calls'] = edge_stats['total_calls']  # calls (unchanged semantics)
+                                log_dict['cd_edge/total_edges'] = edge_stats['total_edges']  # NEW: sampled edges
+                    except Exception:
+                        pass
                     import wandb as _wandb
                     _wandb.log(log_dict, commit=True)
                 except Exception as _e:
                     dist.print0(f'[W&B] log failed: {_e}')
         dist.update_progress(cur_nimg // 1000, total_kimg)
+        
+        # Synchronize all ranks after rank-0-only logging to prevent desync before collective ops.
+        torch.distributed.barrier()
 
+        # Print cumulative CD edge statistics before validation (if CD mode, on validation schedule only).
+        try:
+            if hasattr(loss_fn, 'get_edge_stats') and validation_kwargs is not None:
+                # Mirror validation schedule: every = validation_kwargs['every']
+                every = int(validation_kwargs.get('every', 0) or 0)
+                should_report = (every > 0 and (cur_tick % every == 0)) or every == 0
+                if should_report:
+                    # Do NOT reset here: we want cumulative stats since start.
+                    stats = loss_fn.get_edge_stats(reset=False)
+                    if stats.get('total_edges', 0) > 0:
+                        dist.print0(f"[CD STATS CUM] Calls so far: {stats['total_calls']} (sampled edges: {stats['total_edges']})")
+                        dist.print0(f"[CD STATS CUM]   Terminal edges (σ_s=0): {stats['terminal_edges']} ({stats['terminal_pct']:.2f}%)")
+                        dist.print0(f"[CD STATS CUM]   Boundary match (σ_s=σ_bdry): {stats['boundary_match']} ({stats['boundary_match_pct']:.2f}%)")
+                        dist.print0(f"[CD STATS CUM]   General interior: {stats['general_edges']}")
+        except Exception as _e:
+            dist.print0(f'[CD STATS] failed: {_e}')
+        
         # Built-in validation hook (runs on schedule; blocks training).
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] before maybe_validate', flush=True)
         try:
             cur_kimg = cur_nimg // 1000
             maybe_validate(
@@ -399,6 +566,66 @@ def training_loop(
             )
         except Exception as _e:
             dist.print0(f'[VAL] validation failed: {_e}')
+        if os.environ.get('CD_DDP_DEBUG'):
+            print(f'[RANK {dist.get_rank()}] after maybe_validate', flush=True)
+
+        # Save network snapshot (after validation on this tick).
+        if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: starting', flush=True)
+            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            # Also save target_ema if it exists (for CD target mode).
+            if target_ema_net is not None:
+                data['target_ema'] = target_ema_net
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: processing {len(data)} items', flush=True)
+            for key, value in data.items():
+                if isinstance(value, torch.nn.Module):
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: deepcopy {key}', flush=True)
+                    value = copy.deepcopy(value).eval().requires_grad_(False)
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: check_ddp_consistency {key}', flush=True)
+                    misc.check_ddp_consistency(value)
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: move {key} to CPU', flush=True)
+                    data[key] = value.cpu()
+                    if os.environ.get('CD_DDP_DEBUG'):
+                        print(f'[RANK {dist.get_rank()}] snapshot: {key} done', flush=True)
+                del value  # conserve memory
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: writing to disk (rank 0 only)', flush=True)
+            if dist.get_rank() == 0:
+                with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
+                    pickle.dump(data, f)
+            # CRITICAL: All ranks must wait for rank 0 to finish writing before continuing.
+            # Without this barrier, other ranks will start the next training iteration while
+            # rank 0 is still writing, causing NCCL timeout when they try to synchronize.
+            torch.distributed.barrier()
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] snapshot: done', flush=True)
+            del data  # conserve memory
+
+        # Save full dump of the training state (after validation and snapshot).
+        # NOTE: Only rank 0 writes the file, but ALL ranks must wait before starting the
+        # next iteration to avoid some ranks entering the next backward() while rank 0
+        # is still busy with torch.save(), which would otherwise cause NCCL allreduce
+        # timeouts (some ranks enqueuing gradient allreduces while others haven't yet).
+        need_state_dump = (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0
+        if need_state_dump and dist.get_rank() == 0:
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] state_dump: starting', flush=True)
+            state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
+            # Also save target_ema state if it exists.
+            if target_ema_net is not None:
+                state_dict['target_ema'] = target_ema_net
+            torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            if os.environ.get('CD_DDP_DEBUG'):
+                print(f'[RANK {dist.get_rank()}] state_dump: done', flush=True)
+        # All ranks participate in this barrier exactly on the same ticks where we dump
+        # state, ensuring no one starts the next iteration early relative to rank 0.
+        if need_state_dump:
+            torch.distributed.barrier()
 
         # Update state.
         cur_tick += 1
