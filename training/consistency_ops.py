@@ -182,33 +182,69 @@ def partition_edges_by_sigma(student_sigmas: torch.Tensor, teacher_sigmas: torch
     return torch.tensor(bounds, dtype=torch.long, device=student_sigmas.device)
 
 
-def compute_importance_weights(teacher_sigmas: torch.Tensor, rho: float) -> torch.Tensor:
+def compute_importance_weights(
+    teacher_sigmas: torch.Tensor, 
+    rho: float,
+    mode: str = "vp",
+    P_mean: float = -1.2,
+    P_std: float = 1.2,
+) -> torch.Tensor:
     """
-    Compute importance weights for teacher edges to match VP/MSCD uniform-t sampling.
-    
-    The weight formula is derived from importance sampling:
-        w(σ) ∝ σ^(1-1/ρ) / (1+σ²)
-    
-    This transforms Karras grid sampling (uniform in σ^(1/ρ)) to VP-equivalent
-    uniform-t sampling (Half-Cauchy in σ-space).
+    Compute importance weights for teacher edges based on sampling mode.
     
     Args:
         teacher_sigmas: FloatTensor of shape (T+1,) with terminal 0
         rho: Karras schedule exponent (typically 7.0)
+        mode: Sampling mode:
+            - "uniform": Equal weights (no importance sampling)
+            - "vp": VP/MSCD uniform-t sampling (Half-Cauchy in σ-space)
+                   w(σ) ∝ σ^(1-1/ρ) / (1+σ²)
+                   Gives ~88% in FID-critical [0.1, 10]
+            - "edm": EDM's log-normal training distribution
+                   ln(σ) ~ N(P_mean, P_std²)
+                   Gives ~82% in [0.1, 10] with default P_mean=-1.2, P_std=1.2
+        P_mean: Mean of log-normal (only used if mode="edm"), default -1.2
+        P_std: Std of log-normal (only used if mode="edm"), default 1.2
     
     Returns:
         weights: FloatTensor of shape (T,) normalized to sum to 1
     """
+    import math
+    
     # Exclude terminal 0
     sigmas = teacher_sigmas[:-1].float()
+    T = len(sigmas)
     
-    # w(σ) = σ^(1-1/ρ) / (1+σ²)
-    # Add small epsilon to avoid issues at σ=0
-    exponent = 1.0 - 1.0 / rho
-    weights = (sigmas + 1e-10) ** exponent / (1.0 + sigmas ** 2)
+    if mode == "uniform":
+        # Equal weights
+        weights = torch.ones(T, device=sigmas.device, dtype=torch.float32)
+    
+    elif mode == "vp":
+        # VP/MSCD uniform-t: w(σ) = σ^(1-1/ρ) / (1+σ²)
+        # This transforms Karras grid (uniform in σ^(1/ρ)) to VP's uniform-t
+        exponent = 1.0 - 1.0 / rho
+        weights = (sigmas + 1e-10) ** exponent / (1.0 + sigmas ** 2)
+    
+    elif mode == "edm":
+        # EDM's log-normal: p(σ) ∝ (1/σ) * exp(-(ln(σ) - P_mean)² / (2*P_std²))
+        # But we need importance weights relative to Karras grid density
+        # Karras density: p_karras(σ) ∝ σ^(1/ρ - 1)
+        # So: w(σ) = p_edm(σ) / p_karras(σ)
+        #          ∝ [1/σ * exp(...)] / [σ^(1/ρ - 1)]
+        #          = σ^(-1/ρ) * exp(-(ln(σ) - P_mean)² / (2*P_std²))
+        log_sigmas = torch.log(sigmas + 1e-10)
+        log_prob = -0.5 * ((log_sigmas - P_mean) / P_std) ** 2
+        # Importance weight = p_edm / p_karras
+        # p_edm ∝ (1/σ) * exp(log_prob)
+        # p_karras ∝ σ^(1/ρ - 1)
+        # w = (1/σ) * exp(log_prob) / σ^(1/ρ - 1) = σ^(-1/ρ) * exp(log_prob)
+        weights = (sigmas + 1e-10) ** (-1.0 / rho) * torch.exp(log_prob)
+    
+    else:
+        raise ValueError(f"Unknown sampling mode: {mode}. Use 'uniform', 'vp', or 'edm'.")
     
     # Normalize
-    weights = weights / weights.sum()
+    weights = weights / weights.sum().clamp(min=1e-10)
     return weights
 
 
@@ -222,8 +258,10 @@ def sample_segment_and_teacher_pair(
     anchor_by_sigma: bool = True,
     sigma_bounds: torch.Tensor = None,
     terminal_k: int = None,
-    importance_sampling: bool = True,
+    sampling_mode: str = "vp",
     rho: float = 7.0,
+    P_mean: float = -1.2,
+    P_std: float = 1.2,
 ) -> Dict[str, torch.Tensor]:
     """
     Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
@@ -242,8 +280,13 @@ def sample_segment_and_teacher_pair(
         anchor_by_sigma: use sigma-anchored segmentation
         sigma_bounds: precomputed bounds from partition_edges_by_sigma
         terminal_k: index of terminal teacher edge
-        importance_sampling: if True, use VP-equivalent importance weights (default True)
+        sampling_mode: Edge sampling distribution mode:
+            - "uniform": Equal probability for all edges/segments
+            - "vp": VP/MSCD uniform-t (Half-Cauchy), ~88% FID-critical [0.1, 10]
+            - "edm": EDM's log-normal training distribution, ~82% in [0.1, 10]
         rho: Karras schedule exponent for importance weight computation
+        P_mean: Log-normal mean (only for mode="edm"), default -1.2
+        P_std: Log-normal std (only for mode="edm"), default 1.2
 
     Returns:
         Dict with:
@@ -264,9 +307,10 @@ def sample_segment_and_teacher_pair(
     corresponds to the teacher edge closest to the student boundary (lowest sigma in
     the segment), except for the terminal segment where terminal edges are flagged.
     
-    If importance_sampling is True, edges are sampled with weights w(σ) ∝ σ^(1-1/ρ)/(1+σ²)
-    to match VP/MSCD's uniform-t sampling distribution. This focuses ~88% of samples on
-    the FID-critical σ range [0.1, 10] vs ~46% with uniform sampling.
+    Sampling modes:
+        - "uniform": Original uniform sampling (~46% FID-critical)
+        - "vp": Importance weights w(σ) ∝ σ^(1-1/ρ)/(1+σ²) to match MSCD's VP uniform-t (~88%)
+        - "edm": Importance weights to match EDM's log-normal training distribution (~82%)
     
     Note: Changing batch_size from 1 to N alters RNG consumption (N independent draws per call
     vs 1 draw per call), which affects reproducibility vs legacy single-edge-per-batch behavior.
@@ -277,9 +321,12 @@ def sample_segment_and_teacher_pair(
     boundaries = boundaries.to(device)
     teacher_sigmas = teacher_sigmas.to(device)
     
-    # Compute importance weights if enabled
-    if importance_sampling:
-        edge_weights = compute_importance_weights(teacher_sigmas, rho).to(device)
+    # Compute importance weights based on sampling mode
+    use_importance = sampling_mode in ("vp", "edm")
+    if use_importance:
+        edge_weights = compute_importance_weights(
+            teacher_sigmas, rho, mode=sampling_mode, P_mean=P_mean, P_std=P_std
+        ).to(device)
     else:
         edge_weights = None
 
@@ -287,7 +334,7 @@ def sample_segment_and_teacher_pair(
         assert sigma_bounds is not None and sigma_bounds.shape == (S, 2)
         sigma_bounds = sigma_bounds.to(device)
         
-        if importance_sampling and edge_weights is not None:
+        if use_importance and edge_weights is not None:
             # Compute segment-level importance weights (sum of edge weights in each segment)
             seg_weights = torch.zeros(S, device=device, dtype=torch.float32)
             for j in range(S):
@@ -308,7 +355,7 @@ def sample_segment_and_teacher_pair(
         k1 = sigma_bounds[step_j, 1]
         seg_len_j = (k1 - k0 + 1).clamp(min=1)
 
-        if importance_sampling and edge_weights is not None:
+        if use_importance and edge_weights is not None:
             # Within-segment importance sampling
             # For each sample, we need to sample an edge from its segment with importance weights
             k_t = torch.empty(batch_size, device=device, dtype=torch.long)
@@ -353,7 +400,7 @@ def sample_segment_and_teacher_pair(
         # Index-anchored (original MSCD) segmentation.
         seg_len = boundaries[1:] - boundaries[:-1]  # shape (S,)
         
-        if importance_sampling and edge_weights is not None:
+        if use_importance and edge_weights is not None:
             # Compute segment-level importance weights (sum of edge weights in each segment)
             seg_weights = torch.zeros(S, device=device, dtype=torch.float32)
             for j in range(S):
@@ -372,7 +419,7 @@ def sample_segment_and_teacher_pair(
         
         seg_len_j = seg_len[step_j]  # shape (batch_size,)
 
-        if importance_sampling and edge_weights is not None:
+        if use_importance and edge_weights is not None:
             # Within-segment importance sampling for index-anchored mode
             k_t = torch.empty(batch_size, device=device, dtype=torch.long)
             n_rel = torch.empty(batch_size, device=device, dtype=torch.long)

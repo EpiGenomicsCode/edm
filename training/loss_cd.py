@@ -100,7 +100,7 @@ class EDMConsistencyDistillLoss:
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
         target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA or teacher)
         anchor_by_sigma: bool = True,   # If True, segment teacher edges in sigma-space (closest-to-boundary first)
-        importance_sampling: bool = True,  # If True, use VP-equivalent importance weights for sampling (matches MSCD uniform-t)
+        sampling_mode: str = "vp",  # Edge sampling: "uniform" | "vp" (MSCD uniform-t) | "edm" (log-normal)
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
@@ -140,7 +140,8 @@ class EDMConsistencyDistillLoss:
         # - Frozen teacher: for debugging
         self.target_net = target_net
         self.anchor_by_sigma = bool(anchor_by_sigma)
-        self.importance_sampling = bool(importance_sampling)
+        assert sampling_mode in ("uniform", "vp", "edm"), f"Invalid sampling_mode: {sampling_mode}"
+        self.sampling_mode = sampling_mode
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -356,7 +357,7 @@ class EDMConsistencyDistillLoss:
             anchor_by_sigma=self.anchor_by_sigma,
             sigma_bounds=sigma_bounds,
             terminal_k=terminal_k,
-            importance_sampling=self.importance_sampling,
+            sampling_mode=self.sampling_mode,
             rho=self.rho,
         )
 
