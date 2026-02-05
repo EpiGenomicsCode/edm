@@ -335,56 +335,44 @@ def sample_segment_and_teacher_pair(
         sigma_bounds = sigma_bounds.to(device)
         
         if use_importance and edge_weights is not None:
-            # Compute segment-level importance weights (sum of edge weights in each segment)
-            seg_weights = torch.zeros(S, device=device, dtype=torch.float32)
-            for j in range(S):
-                k_start = int(sigma_bounds[j, 0].item())
-                k_end = int(sigma_bounds[j, 1].item())
-                seg_weights[j] = edge_weights[k_start:k_end + 1].sum()
+            # VECTORIZED importance sampling: sample edges directly, then map to segments
+            # This avoids slow per-sample Python loops that cause NCCL timeouts.
             
-            # Normalize segment weights
-            seg_weights = seg_weights / seg_weights.sum().clamp(min=1e-10)
+            # Step 1: Sample edges directly with importance weights (single batch multinomial)
+            k_t = torch.multinomial(edge_weights, batch_size, replacement=True, generator=generator)
             
-            # Sample segment j with importance weights
-            step_j = torch.multinomial(seg_weights, batch_size, replacement=True, generator=generator)
+            # Step 2: Map each sampled edge k_t to its segment j
+            # For sigma-anchored: segment j contains edges where sigma_bounds[j,0] <= k <= sigma_bounds[j,1]
+            # We use searchsorted on the lower bounds to find which segment each k_t belongs to
+            k_starts = sigma_bounds[:, 0].contiguous()  # [S], contiguous for searchsorted perf
+            k_ends = sigma_bounds[:, 1]    # [S]
+            
+            # Find segment j such that k_starts[j] <= k_t <= k_ends[j]
+            # Since segments are contiguous and non-overlapping, we can use the upper bound check
+            # step_j[i] = max j such that k_starts[j] <= k_t[i]
+            step_j = torch.searchsorted(k_starts, k_t, right=True) - 1
+            step_j = step_j.clamp(min=0, max=S-1)
+            
+            # Step 3: Compute n_rel (relative position within segment)
+            # n_rel = 1 means closest to lower boundary (k_end), higher = closer to k_start
+            k0 = k_starts[step_j]
+            k1 = k_ends[step_j]
+            seg_len_j = (k1 - k0 + 1).clamp(min=1)
+            
+            # local_idx = k_t - k0 (0 = at k_start, seg_len-1 = at k_end)
+            local_idx = k_t - k0
+            # n_rel: 1 = closest to boundary (k_end), seg_len = at k_start
+            n_rel = seg_len_j - local_idx
+            n_rel = n_rel.clamp(min=1)
         else:
             # Uniform segment sampling (original behavior)
             step_j = torch.randint(low=0, high=S, size=(batch_size,), device=device, dtype=torch.long, generator=generator)
-        
-        k0 = sigma_bounds[step_j, 0]
-        k1 = sigma_bounds[step_j, 1]
-        seg_len_j = (k1 - k0 + 1).clamp(min=1)
-
-        if use_importance and edge_weights is not None:
-            # Within-segment importance sampling
-            # For each sample, we need to sample an edge from its segment with importance weights
-            k_t = torch.empty(batch_size, device=device, dtype=torch.long)
-            n_rel = torch.empty(batch_size, device=device, dtype=torch.long)
             
-            for i in range(batch_size):
-                k_start_i = int(k0[i].item())
-                k_end_i = int(k1[i].item())
-                seg_len_i = k_end_i - k_start_i + 1
-                
-                if seg_len_i == 1:
-                    # Only one edge in segment
-                    k_t[i] = k_start_i
-                    n_rel[i] = 1
-                else:
-                    # Sample edge within segment with importance weights
-                    seg_edge_weights = edge_weights[k_start_i:k_end_i + 1]
-                    seg_edge_weights = seg_edge_weights / seg_edge_weights.sum().clamp(min=1e-10)
-                    
-                    # Sample local index within segment
-                    local_idx = torch.multinomial(seg_edge_weights, 1, generator=generator).item()
-                    k_t[i] = k_start_i + local_idx
-                    
-                    # n_rel: 1 = closest to boundary (k_end_i), increasing toward k_start_i
-                    # local_idx=0 → k_start_i → n_rel = seg_len_i
-                    # local_idx=seg_len_i-1 → k_end_i → n_rel = 1
-                    n_rel[i] = seg_len_i - local_idx
-        else:
-            # Uniform within-segment sampling (original behavior)
+            k0 = sigma_bounds[step_j, 0]
+            k1 = sigma_bounds[step_j, 1]
+            seg_len_j = (k1 - k0 + 1).clamp(min=1)
+            
+            # Uniform within-segment sampling
             u = torch.empty(batch_size, device=device, dtype=torch.float32)
             if generator is not None:
                 u.uniform_(0.0, 1.0, generator=generator)
@@ -401,47 +389,33 @@ def sample_segment_and_teacher_pair(
         seg_len = boundaries[1:] - boundaries[:-1]  # shape (S,)
         
         if use_importance and edge_weights is not None:
-            # Compute segment-level importance weights (sum of edge weights in each segment)
-            seg_weights = torch.zeros(S, device=device, dtype=torch.float32)
-            for j in range(S):
-                k_start = int(boundaries[j].item())
-                k_end = int(boundaries[j + 1].item())
-                seg_weights[j] = edge_weights[k_start:k_end].sum()
+            # VECTORIZED importance sampling: sample edges directly, then map to segments
+            # This avoids slow per-sample Python loops that cause NCCL timeouts.
             
-            # Normalize segment weights
-            seg_weights = seg_weights / seg_weights.sum().clamp(min=1e-10)
+            # Step 1: Sample edges directly with importance weights (single batch multinomial)
+            # Note: For index-anchored mode, edges go from 0 to T-1 (boundaries cover [0, T])
+            # We only sample from edges in valid segments (0 to T-1)
+            valid_edge_weights = edge_weights[:T]  # Exclude edge T (terminal boundary)
+            k_t = torch.multinomial(valid_edge_weights, batch_size, replacement=True, generator=generator)
             
-            # Sample segment j with importance weights
-            step_j = torch.multinomial(seg_weights, batch_size, replacement=True, generator=generator)
+            # Step 2: Map each sampled edge k_t to its segment j
+            # Segment j contains edges where boundaries[j] <= k < boundaries[j+1]
+            # Use searchsorted to find segment
+            step_j = torch.searchsorted(boundaries[1:], k_t, right=True)  # boundaries[1:] gives upper bounds
+            step_j = step_j.clamp(min=0, max=S-1)
+            
+            # Step 3: Compute n_rel (1-indexed position within segment)
+            # local_idx = k_t - boundaries[step_j]
+            seg_start = boundaries[step_j]
+            n_rel = (k_t - seg_start + 1).clamp(min=1)
+            
+            seg_len_j = seg_len[step_j]
         else:
             # Uniform segment sampling (original behavior)
             step_j = torch.randint(low=0, high=S, size=(batch_size,), device=device, dtype=torch.long, generator=generator)
-        
-        seg_len_j = seg_len[step_j]  # shape (batch_size,)
-
-        if use_importance and edge_weights is not None:
-            # Within-segment importance sampling for index-anchored mode
-            k_t = torch.empty(batch_size, device=device, dtype=torch.long)
-            n_rel = torch.empty(batch_size, device=device, dtype=torch.long)
+            seg_len_j = seg_len[step_j]  # shape (batch_size,)
             
-            for i in range(batch_size):
-                k_start_i = int(boundaries[step_j[i]].item())
-                k_end_i = int(boundaries[step_j[i] + 1].item())
-                seg_len_i = k_end_i - k_start_i
-                
-                if seg_len_i == 1:
-                    k_t[i] = k_start_i
-                    n_rel[i] = 1
-                else:
-                    # Sample edge within segment with importance weights
-                    seg_edge_weights = edge_weights[k_start_i:k_end_i]
-                    seg_edge_weights = seg_edge_weights / seg_edge_weights.sum().clamp(min=1e-10)
-                    
-                    local_idx = torch.multinomial(seg_edge_weights, 1, generator=generator).item()
-                    k_t[i] = k_start_i + local_idx
-                    n_rel[i] = local_idx + 1  # 1-indexed relative position
-        else:
-            # Uniform within-segment sampling (original behavior)
+            # Uniform within-segment sampling
             u = torch.empty(batch_size, device=device, dtype=torch.float32)
             if generator is not None:
                 u.uniform_(0.0, 1.0, generator=generator)
