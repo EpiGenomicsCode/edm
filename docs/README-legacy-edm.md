@@ -133,6 +133,21 @@ torchrun --standalone --nproc_per_node=1 fid.py calc --images=fid-tmp \
 
 Both of the above commands can be parallelized across multiple GPUs by adjusting `--nproc_per_node`. The second command typically takes 1-3 minutes in practice, but the first one can sometimes take several hours, depending on the configuration. See [`python fid.py --help`](../docs/fid-help.txt) for the full list of options.
 
+Alternatively, if you only have one GPU, run the following:
+
+```.bash
+# Generate 50000 images and save them as fid-tmp/*/*.png
+python generate.py --outdir=fid-tmp --seeds=0-49999 --subdirs  --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+
+# Calculate FID
+python fid.py calc --images=fid-tmp  --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
+```
+
+If there is an error message about OpenMp conflict, run the following in the power shell before FID calculation:
+```
+$env:KMP_DUPLICATE_LIB_OK = "TRUE"
+```
+
 Note that the numerical value of FID varies across different random seeds and is highly sensitive to the number of images. By default, `fid.py` will always use 50,000 generated images; providing fewer images will result in an error, whereas providing more will use a random subset. To reduce the effect of random variation, we recommend repeating the calculation multiple times with different seeds, e.g., `--seeds=0-49999`, `--seeds=50000-99999`, and `--seeds=100000-149999`. In our paper, we calculated each FID three times and reported the minimum.
 
 Also note that it is important to compare the generated images against the same dataset that the model was originally trained with. To facilitate evaluation, we provide the exact reference statistics that correspond to our pre-trained models:
