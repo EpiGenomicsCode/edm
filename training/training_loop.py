@@ -418,6 +418,7 @@ def training_loop(
                         wandb_payload['Loss/loss_step'] = step_record['loss']
                     # Map cached CD diagnostics (if present) to W&B-friendly names.
                     cd_map = {
+                        # Original gain metrics
                         'cd_gain_mean': 'CD/gain_mean',
                         'cd_gain_max': 'CD/gain_max',
                         'cd_gain_95p': 'CD/gain_95p',
@@ -427,6 +428,26 @@ def training_loop(
                         'cd_gain_general_mean': 'CD/gain_general_mean',
                         'cd_loss_mean': 'CD/loss_mean',
                         'cd_loss_gain_corr': 'CD/loss_gain_corr',
+                        # DIAGNOSTIC 1: Per-edge L2 error
+                        'cd_l2_error_all': 'CD/l2_error_all',
+                        'cd_l2_error_terminal': 'CD/l2_error_terminal',
+                        'cd_l2_error_boundary': 'CD/l2_error_boundary',
+                        'cd_l2_error_general': 'CD/l2_error_general',
+                        # DIAGNOSTIC 3: Student-Teacher divergence
+                        'cd_st_divergence': 'CD/st_divergence',
+                        'cd_st_divergence_max': 'CD/st_divergence_max',
+                        'cd_st_div_terminal': 'CD/st_div_terminal',
+                        'cd_st_div_boundary': 'CD/st_div_boundary',
+                        'cd_st_div_general': 'CD/st_div_general',
+                        # DIAGNOSTIC 4: Gradient fraction
+                        'cd_grad_frac_terminal': 'CD/grad_frac_terminal',
+                        'cd_grad_frac_boundary': 'CD/grad_frac_boundary',
+                        'cd_grad_frac_general': 'CD/grad_frac_general',
+                        # DIAGNOSTIC 6: Gradient conflict analysis
+                        'cd_grad_conflict': 'CD/grad_conflict_boundary_general',
+                        'cd_grad_norm_boundary': 'CD/grad_norm_boundary',
+                        'cd_grad_norm_general': 'CD/grad_norm_general',
+                        'cd_grad_norm_ratio': 'CD/grad_norm_ratio_boundary_general',
                     }
                     for key_src, key_dst in cd_map.items():
                         if key_src in step_record and step_record[key_src] is not None:
