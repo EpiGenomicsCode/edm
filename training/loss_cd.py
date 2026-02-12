@@ -598,6 +598,63 @@ class EDMConsistencyDistillLoss:
                 training_stats.report('CD/loss_gain_corr', (gain * loss_mean_per_sample).mean())
                 
                 # =========================================================================
+                # DIAGNOSTIC 0: Loss spike analysis
+                # =========================================================================
+                # Detect per-sample outliers whose loss is far above the batch median.
+                # We use median + 5*MAD (median absolute deviation) as a robust threshold;
+                # any sample exceeding this is a "spike".  We then log the composition
+                # of spikes (edge type, sigma_t, gain, etc.) so we can correlate.
+                batch_median_loss = loss_mean_per_sample.median()
+                batch_mad = (loss_mean_per_sample - batch_median_loss).abs().median().clamp(min=1e-12)
+                spike_threshold = batch_median_loss + 5.0 * batch_mad
+                is_spike = loss_mean_per_sample > spike_threshold  # [N] bool
+                num_spikes = int(is_spike.sum().item())
+                
+                training_stats.report('CD/spike_count', torch.as_tensor(float(num_spikes), device=device))
+                training_stats.report('CD/spike_threshold', spike_threshold)
+                training_stats.report('CD/spike_frac', torch.as_tensor(float(num_spikes) / max(batch_size, 1), device=device))
+                
+                if num_spikes > 0:
+                    spike_losses = loss_mean_per_sample[is_spike]
+                    training_stats.report('CD/spike_loss_mean', spike_losses.mean())
+                    training_stats.report('CD/spike_loss_max', spike_losses.max())
+                    
+                    # What edge types are the spikes?
+                    spike_terminal = (is_spike & is_terminal).sum().float()
+                    spike_boundary = (is_spike & is_boundary_snap).sum().float()
+                    spike_general  = (is_spike & general_mask).sum().float()
+                    training_stats.report('CD/spike_pct_terminal', spike_terminal / max(num_spikes, 1))
+                    training_stats.report('CD/spike_pct_boundary', spike_boundary / max(num_spikes, 1))
+                    training_stats.report('CD/spike_pct_general',  spike_general  / max(num_spikes, 1))
+                    
+                    # Sigma and gain profile of spikes
+                    training_stats.report('CD/spike_sigma_t_mean', sigma_t_vec[is_spike].mean())
+                    training_stats.report('CD/spike_sigma_t_min',  sigma_t_vec[is_spike].min())
+                    training_stats.report('CD/spike_sigma_t_max',  sigma_t_vec[is_spike].max())
+                    training_stats.report('CD/spike_gain_mean', gain[is_spike].mean())
+                    training_stats.report('CD/spike_gain_max',  gain[is_spike].max())
+                    
+                    # What segment ids are producing spikes?
+                    training_stats.report('CD/spike_seg_id_mean', j[is_spike].float().mean())
+                    
+                    # Weight (EDM weighting) of spike samples — are high-weight samples spiking?
+                    training_stats.report('CD/spike_weight_mean', weight.view(-1)[is_spike].mean())
+                else:
+                    # Report zeros / empty so stat names stay consistent
+                    training_stats.report('CD/spike_loss_mean', [])
+                    training_stats.report('CD/spike_loss_max', [])
+                    training_stats.report('CD/spike_pct_terminal', [])
+                    training_stats.report('CD/spike_pct_boundary', [])
+                    training_stats.report('CD/spike_pct_general', [])
+                    training_stats.report('CD/spike_sigma_t_mean', [])
+                    training_stats.report('CD/spike_sigma_t_min', [])
+                    training_stats.report('CD/spike_sigma_t_max', [])
+                    training_stats.report('CD/spike_gain_mean', [])
+                    training_stats.report('CD/spike_gain_max', [])
+                    training_stats.report('CD/spike_seg_id_mean', [])
+                    training_stats.report('CD/spike_weight_mean', [])
+                
+                # =========================================================================
                 # DIAGNOSTIC 1: Per-edge breakdown of consistency error (L2)
                 # =========================================================================
                 # Compute per-sample L2 error (squared norm across CHW)
@@ -789,6 +846,35 @@ class EDMConsistencyDistillLoss:
                         'cd_grad_frac_boundary': float((boundary_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
                         'cd_grad_frac_general': float((general_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
                     }
+                    
+                    # DIAGNOSTIC 0: Loss spike analysis
+                    self._last_step_metrics['cd_spike_count'] = num_spikes
+                    self._last_step_metrics['cd_spike_frac'] = float(num_spikes) / max(batch_size, 1)
+                    if num_spikes > 0:
+                        self._last_step_metrics['cd_spike_loss_mean'] = float(spike_losses.mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_loss_max'] = float(spike_losses.max().detach().cpu())
+                        spike_terminal = (is_spike & is_terminal).sum().float()
+                        spike_boundary = (is_spike & is_boundary_snap).sum().float()
+                        spike_general  = (is_spike & general_mask).sum().float()
+                        self._last_step_metrics['cd_spike_pct_terminal'] = float(spike_terminal / max(num_spikes, 1))
+                        self._last_step_metrics['cd_spike_pct_boundary'] = float(spike_boundary / max(num_spikes, 1))
+                        self._last_step_metrics['cd_spike_pct_general'] = float(spike_general / max(num_spikes, 1))
+                        self._last_step_metrics['cd_spike_sigma_t_mean'] = float(sigma_t_vec[is_spike].mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_gain_mean'] = float(gain[is_spike].mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_gain_max'] = float(gain[is_spike].max().detach().cpu())
+                        self._last_step_metrics['cd_spike_seg_id_mean'] = float(j[is_spike].float().mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_weight_mean'] = float(weight.view(-1)[is_spike].mean().detach().cpu())
+                    else:
+                        self._last_step_metrics['cd_spike_loss_mean'] = None
+                        self._last_step_metrics['cd_spike_loss_max'] = None
+                        self._last_step_metrics['cd_spike_pct_terminal'] = None
+                        self._last_step_metrics['cd_spike_pct_boundary'] = None
+                        self._last_step_metrics['cd_spike_pct_general'] = None
+                        self._last_step_metrics['cd_spike_sigma_t_mean'] = None
+                        self._last_step_metrics['cd_spike_gain_mean'] = None
+                        self._last_step_metrics['cd_spike_gain_max'] = None
+                        self._last_step_metrics['cd_spike_seg_id_mean'] = None
+                        self._last_step_metrics['cd_spike_weight_mean'] = None
                     
                     # DIAGNOSTIC 6: Gradient conflict (only if both boundary and general exist)
                     if is_boundary_snap.any() and general_mask.any():

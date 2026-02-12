@@ -448,6 +448,19 @@ def training_loop(
                         'cd_grad_norm_boundary': 'CD/grad_norm_boundary',
                         'cd_grad_norm_general': 'CD/grad_norm_general',
                         'cd_grad_norm_ratio': 'CD/grad_norm_ratio_boundary_general',
+                        # DIAGNOSTIC 0: Loss spike analysis
+                        'cd_spike_count': 'CD/spike_count',
+                        'cd_spike_frac': 'CD/spike_frac',
+                        'cd_spike_loss_mean': 'CD/spike_loss_mean',
+                        'cd_spike_loss_max': 'CD/spike_loss_max',
+                        'cd_spike_pct_terminal': 'CD/spike_pct_terminal',
+                        'cd_spike_pct_boundary': 'CD/spike_pct_boundary',
+                        'cd_spike_pct_general': 'CD/spike_pct_general',
+                        'cd_spike_sigma_t_mean': 'CD/spike_sigma_t_mean',
+                        'cd_spike_gain_mean': 'CD/spike_gain_mean',
+                        'cd_spike_gain_max': 'CD/spike_gain_max',
+                        'cd_spike_seg_id_mean': 'CD/spike_seg_id_mean',
+                        'cd_spike_weight_mean': 'CD/spike_weight_mean',
                     }
                     for key_src, key_dst in cd_map.items():
                         if key_src in step_record and step_record[key_src] is not None:
