@@ -59,12 +59,12 @@ def parse_int_list(s):
 @click.option('--rho',           help='Karras rho exponent', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=7.0, show_default=True)
 @click.option('--sigma_min',     help='Minimum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.002, show_default=True)
 @click.option('--sigma_max',     help='Maximum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=80.0, show_default=True)
-@click.option('--cd_loss',       help='Consistency loss type', metavar='STR', type=click.Choice(['huber', 'l2', 'l2_root']), default='huber', show_default=True)
+@click.option('--cd_loss',       help='Consistency loss type', metavar='STR', type=click.Choice(['huber', 'l2', 'l2_root', 'pseudo_huber']), default='huber', show_default=True)
 @click.option(
     '--cd_weight_mode',
     help='Consistency weight mode',
-    metavar='edm|vlike|flat|snr|snr+1|karras|truncated-snr|uniform',
-    type=click.Choice(['edm', 'vlike', 'flat', 'snr', 'snr+1', 'karras', 'truncated-snr', 'uniform']),
+    metavar='edm|vlike|flat|snr|snr+1|karras|sqrt_karras|truncated-snr|uniform',
+    type=click.Choice(['edm', 'vlike', 'flat', 'snr', 'snr+1', 'karras', 'sqrt_karras', 'truncated-snr', 'uniform']),
     default='edm',
     show_default=True,
 )

@@ -27,6 +27,26 @@ def _huber_loss(x: torch.Tensor, delta: float = 1e-4) -> torch.Tensor:
     return 0.5 * (quad * quad) + (abs_x - quad) * delta
 
 
+def _pseudo_huber_vector_norm(diff: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Pseudo-Huber applied to the Euclidean vector norm (per sample).
+
+    Computes  sqrt(||diff||^2 + eps^2) - eps  where ||·|| is the L2 norm
+    across all spatial/channel dims.  For ||diff|| >> eps this equals ||diff||;
+    near zero it smoothly transitions to a quadratic (differentiable everywhere).
+
+    This matches the MSCD paper's "huber epsilon of 1e-4" formulation.
+
+    Args:
+        diff: [N, C, H, W] tensor of per-pixel differences.
+        eps:  Huber smoothing parameter (paper uses 1e-4 for ImageNet).
+
+    Returns:
+        [N] tensor of per-sample pseudo-Huber norms.
+    """
+    norm_sq = (diff * diff).sum(dim=[1, 2, 3])  # [N]
+    return torch.sqrt(norm_sq + eps * eps) - eps
+
+
 def _save_image_grid(tensors: List[torch.Tensor], path: str, nrow: int = 6):
     """
     Save a grid of images without requiring torchvision.
@@ -93,8 +113,8 @@ class EDMConsistencyDistillLoss:
         S_min: float = 0.05,
         S_max: float = 50.0,
         S_noise: float = 1.003,
-        loss_type: str = "huber",    # "huber" | "l2" (squared) | "l2_root" (euclidean)
-        weight_mode: str = "edm",    # "edm" | "vlike" | "flat" | "snr" | "snr+1" | "karras" | "truncated-snr" | "uniform"
+        loss_type: str = "huber",    # "huber" | "l2" (squared) | "l2_root" (euclidean) | "pseudo_huber" (MSCD paper)
+        weight_mode: str = "edm",    # "edm" | "vlike" | "flat" | "snr" | "snr+1" | "karras" | "sqrt_karras" | "truncated-snr" | "uniform"
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
@@ -104,7 +124,7 @@ class EDMConsistencyDistillLoss:
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
-        assert loss_type in ("huber", "l2", "l2_root")
+        assert loss_type in ("huber", "l2", "l2_root", "pseudo_huber")
         assert weight_mode in (
             "edm",
             "vlike",
@@ -113,6 +133,7 @@ class EDMConsistencyDistillLoss:
             "snr",
             "snr+1",
             "karras",
+            "sqrt_karras",   # sqrt of Karras weight — correct pairing for linear losses (l2_root / pseudo_huber)
             "truncated-snr",
             "uniform",
         )
@@ -302,6 +323,12 @@ class EDMConsistencyDistillLoss:
             return snr + 1.0
         if self.weight_mode == "karras":
             return snr + (1.0 / (self.sigma_data ** 2))
+        if self.weight_mode == "sqrt_karras":
+            # Square root of Karras weight: sqrt((σ² + σ_data²) / (σ·σ_data)²).
+            # Correct pairing for linear losses (l2_root, pseudo_huber) so that
+            # c_out(σ) · w(σ) = 1, giving uniform contribution across σ.
+            # Equivalent to 1 / c_out(σ) where c_out = σ·σ_data / sqrt(σ² + σ_data²).
+            return torch.sqrt(sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data)
         if self.weight_mode == "truncated-snr":
             return torch.clamp(snr, min=1.0)
         # "uniform": OpenAI's name; identical to our "flat" schedule.
@@ -525,6 +552,12 @@ class EDMConsistencyDistillLoss:
         diff = x_hat_t - x_hat_t_star
         if self.loss_type == "huber":
             per_elem = _huber_loss(diff)
+            loss = weight * per_elem
+        elif self.loss_type == "pseudo_huber":
+            # Pseudo-Huber on the vector norm (MSCD paper formulation).
+            # sqrt(||diff||^2 + eps^2) - eps, with eps = 1e-4.
+            per_sample = _pseudo_huber_vector_norm(diff, eps=1e-4)
+            per_elem = per_sample.view(batch_size, 1, 1, 1)
             loss = weight * per_elem
         elif self.loss_type == "l2_root":
             # Euclidean (L2) distance across all channels/pixels per sample.
