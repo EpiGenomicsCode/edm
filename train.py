@@ -81,6 +81,7 @@ def parse_int_list(s):
 @click.option('--cres',          help='Channels per resolution  [default: varies]', metavar='LIST', type=parse_int_list)
 @click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=2e-6, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
+@click.option('--ema_rampup',    help='EMA rampup ratio (0=disable rampup, Song uses 0)', metavar='FLOAT', type=click.FloatRange(min=0), default=0.05, show_default=True)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
@@ -260,6 +261,7 @@ def main(**kwargs):
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)
     c.ema_halflife_kimg = int(opts.ema * 1000)
+    c.ema_rampup_ratio = opts.ema_rampup if opts.ema_rampup > 0 else None
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)

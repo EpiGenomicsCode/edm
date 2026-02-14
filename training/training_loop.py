@@ -91,6 +91,12 @@ def training_loop(
             misc.print_module_summary(net, [images, sigma, labels], max_nesting=2)
 
     # Setup optimizer.
+    dist.print0(f'[EMA CONFIG] Validation EMA: halflife={ema_halflife_kimg} kimg, rampup_ratio={ema_rampup_ratio}')
+    if ema_rampup_ratio is None or ema_rampup_ratio == 0:
+        _fixed_beta = 0.5 ** (batch_size / max(ema_halflife_kimg * 1000, 1e-8))
+        dist.print0(f'[EMA CONFIG]   No rampup → fixed beta={_fixed_beta:.6f} per step (halflife={ema_halflife_kimg*1000/batch_size:.1f} steps)')
+    else:
+        dist.print0(f'[EMA CONFIG]   Rampup active → effective halflife = min({ema_halflife_kimg} kimg, {ema_rampup_ratio}*cur_nimg)')
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
@@ -389,11 +395,17 @@ def training_loop(
                 step_stats_path = os.path.join(run_dir, 'step_stats.jsonl')
                 step_stats_jsonl = open(step_stats_path, 'at')
             # Build a per-step metrics payload from loss + optimizer state.
+            # Compute validation EMA beta for logging (mirrors the update logic below).
+            _ema_hl_nimg = ema_halflife_kimg * 1000
+            if ema_rampup_ratio is not None:
+                _ema_hl_nimg = min(_ema_hl_nimg, cur_nimg * ema_rampup_ratio)
+            _ema_beta_log = 0.5 ** (batch_size / max(_ema_hl_nimg, 1e-8))
             step_record = {
                 'step': cur_step,
                 'nimg': int(cur_nimg),
                 'kimg': float(cur_nimg / 1e3),
                 'tick': int(cur_tick),
+                'ema_beta': float(_ema_beta_log),
                 'lr': float(current_lr),
                 'grad_global_norm': float(grad_global_norm.detach().cpu()),
                 'param_global_norm': float(param_global_norm.detach().cpu()),
@@ -416,6 +428,7 @@ def training_loop(
                         'Grad/global_norm': step_record['grad_global_norm'],
                         'Grad/param_norm': step_record['param_global_norm'],
                         'Grad/update_over_param': step_record['update_over_param'],
+                        'EMA/val_ema_beta': step_record['ema_beta'],
                     }
                     # Per-step loss (separate from tick-level summary loss).
                     if step_record['loss'] is not None:
