@@ -244,7 +244,11 @@ def training_loop(
     torch.distributed.broadcast_object_list(run_dir_list, src=0)
     run_dir = run_dir_list[0] if run_dir_list[0] else None
     dist.ddp_debug(f'run_dir broadcast: after, run_dir="{run_dir}"')
-    
+
+    # Pass run_dir to the loss function for debug logging.
+    if run_dir is not None and hasattr(loss_fn, 'set_run_dir'):
+        loss_fn.set_run_dir(run_dir)
+
     # One-time teacher validation (baseline) using ImageNet defaults if available.
     try:
         if (validation_kwargs is not None
@@ -461,6 +465,20 @@ def training_loop(
                         'cd_spike_gain_max': 'CD/spike_gain_max',
                         'cd_spike_seg_id_mean': 'CD/spike_seg_id_mean',
                         'cd_spike_weight_mean': 'CD/spike_weight_mean',
+                        # DIAGNOSTIC 7: Per-sigma-bucket denoising quality
+                        'cd_denoise_quality_all': 'CD/denoise_quality_all',
+                        'cd_denoise_q_0_01': 'CD/denoise_q_0_01',
+                        'cd_denoise_q_01_1': 'CD/denoise_q_01_1',
+                        'cd_denoise_q_1_10': 'CD/denoise_q_1_10',
+                        'cd_denoise_q_10_80': 'CD/denoise_q_10_80',
+                        # DIAGNOSTIC 8: DDIM ratio for general edges
+                        'cd_ddim_ratio_gen_mean': 'CD/ddim_ratio_gen_mean',
+                        'cd_ddim_ratio_gen_min': 'CD/ddim_ratio_gen_min',
+                        'cd_ddim_frac_self_ref': 'CD/ddim_frac_self_ref',
+                        # DIAGNOSTIC 9: Edge type fractions
+                        'cd_frac_terminal': 'CD/frac_terminal',
+                        'cd_frac_boundary': 'CD/frac_boundary',
+                        'cd_frac_general': 'CD/frac_general',
                     }
                     for key_src, key_dst in cd_map.items():
                         if key_src in step_record and step_record[key_src] is not None:

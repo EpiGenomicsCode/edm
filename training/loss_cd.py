@@ -1,6 +1,7 @@
 import math
 import os
 import copy
+import json as _json_mod
 from typing import Optional, Tuple, Dict, List, Any
 from datetime import datetime
 
@@ -174,6 +175,10 @@ class EDMConsistencyDistillLoss:
         self._count_general_edges = 0       # total general interior edges sampled (per-sample)
         self._count_total_calls = 0         # total __call__ invocations (unchanged semantics)
         self._count_total_edges = 0         # NEW: total sampled edges across all calls (≈ batch_size × calls)
+
+    def set_run_dir(self, run_dir: str) -> None:
+        """Set the training run directory for debug logging."""
+        self._run_dir = run_dir
 
     def set_global_kimg(self, kimg: float) -> None:
         """
@@ -364,6 +369,32 @@ class EDMConsistencyDistillLoss:
         # Now everything below uses the (maybe filtered) teacher_sigmas
         T_edges = teacher_sigmas.shape[0] - 1  # number of edges in CD grid
 
+        # #region agent log — H1: log T_edges and sigma grid (every 200 forward calls)
+        _fwd_cnt = getattr(self, '_dbg_fwd_counter', 0)
+        self._dbg_fwd_counter = _fwd_cnt + 1
+        if _fwd_cnt % 200 == 0 and getattr(self, '_run_dir', None):
+            try:
+                _dbg_path = os.path.join(self._run_dir, 'debug.log')
+                _h1_payload = {
+                    'timestamp': int(datetime.now().timestamp() * 1000),
+                    'location': 'loss_cd.py:__call__:grid_setup',
+                    'message': 'H1 teacher grid snapshot',
+                    'hypothesisId': 'H1',
+                    'runId': 'initial',
+                    'data': {
+                        'T_edges': int(T_edges),
+                        'sigma_max': float(teacher_sigmas[0].cpu()),
+                        'sigma_min_pos': float(teacher_sigmas[-2].cpu()) if teacher_sigmas.shape[0] > 1 else None,
+                        'student_S': self.S,
+                        'fwd_call': _fwd_cnt,
+                    }
+                }
+                with open(_dbg_path, 'a') as _dbf:
+                    _dbf.write(_json_mod.dumps(_h1_payload) + '\n')
+            except Exception:
+                pass
+        # #endregion
+
         # Index-based segment boundaries (for index-anchored path)
         boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
 
@@ -541,6 +572,43 @@ class EDMConsistencyDistillLoss:
                     f"sigma_ref={sigma_ref_vec[i].item():.9f}\n"
                 )
             raise ValueError(error_msg) from e
+
+        # #region agent log — H2/H3: invDDIM target stats (every 200 fwd calls)
+        if _fwd_cnt % 200 == 0 and getattr(self, '_run_dir', None):
+            try:
+                _dbg_path = os.path.join(self._run_dir, 'debug.log')
+                _target_norm = float(torch.sqrt((x_hat_t_star ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
+                _ref_norm = float(torch.sqrt((x_ref_bdry ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
+                _y_norm = float(torch.sqrt((y ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
+                _target_y_err = float(torch.sqrt(((x_hat_t_star - y) ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
+                _h23_payload = {
+                    'timestamp': int(datetime.now().timestamp() * 1000),
+                    'location': 'loss_cd.py:__call__:invDDIM_target',
+                    'message': 'H2/H3 invDDIM target quality',
+                    'hypothesisId': 'H2_H3',
+                    'runId': 'initial',
+                    'data': {
+                        'target_norm_mean': _target_norm,
+                        'ref_bdry_norm_mean': _ref_norm,
+                        'clean_image_norm_mean': _y_norm,
+                        'target_vs_clean_err': _target_y_err,
+                        'gain_mean': float(gain.mean().detach().cpu()),
+                        'gain_max': float(gain.max().detach().cpu()),
+                        'ratio_ref_mean': float(ratio_ref.mean().detach().cpu()),
+                        'ratio_ref_max': float(ratio_ref.max().detach().cpu()),
+                        'sigma_ref_mean': float(sigma_ref_vec.mean().detach().cpu()),
+                        'sigma_t_mean': float(sigma_t_vec.mean().detach().cpu()),
+                        'fwd_call': _fwd_cnt,
+                        'num_terminal': int(is_terminal.sum().item()),
+                        'num_boundary': int(is_boundary_snap.sum().item()),
+                        'num_general': int(is_general.sum().item()),
+                    }
+                }
+                with open(_dbg_path, 'a') as _dbf:
+                    _dbf.write(_json_mod.dumps(_h23_payload) + '\n')
+            except Exception:
+                pass
+        # #endregion
 
         # Student prediction at t (PRD §4.2.7)
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
@@ -847,6 +915,52 @@ class EDMConsistencyDistillLoss:
                     training_stats.report('CD/grad_norm_general', [])
                     training_stats.report('CD/grad_norm_ratio_boundary_general', [])
 
+                # =========================================================================
+                # DIAGNOSTIC 7: Per-sigma-bucket denoising quality (H2 test)
+                # =========================================================================
+                # Measures whether the student loses denoising quality at specific sigma
+                # ranges during training.  ||D(z_t, σ_t) - x|| per sigma bucket.
+                denoise_err = torch.sqrt(((x_hat_t - y) ** 2).sum(dim=[1, 2, 3]).clamp(min=1e-12))  # [N]
+                sigma_flat = sigma_t_vec  # [N], 1-D
+                bucket_lo = torch.tensor([0.0, 0.1, 1.0, 10.0], device=device)
+                bucket_hi = torch.tensor([0.1, 1.0, 10.0, 81.0], device=device)
+                bucket_names = ['0_01', '01_1', '1_10', '10_80']
+                for bname, lo, hi in zip(bucket_names, bucket_lo, bucket_hi):
+                    mask_b = (sigma_flat >= lo) & (sigma_flat < hi)
+                    if mask_b.any():
+                        training_stats.report(f'CD/denoise_q_{bname}', denoise_err[mask_b].mean())
+                    else:
+                        training_stats.report(f'CD/denoise_q_{bname}', [])
+
+                # Overall denoising quality
+                training_stats.report('CD/denoise_quality_all', denoise_err.mean())
+
+                # =========================================================================
+                # DIAGNOSTIC 8: DDIM ratio for general edges (H3 test)
+                # =========================================================================
+                # σ_bdry/σ_s for general edges — how self-referential is the target?
+                # Small ratio means target ≈ student prediction (weak teacher influence).
+                if general_mask.any():
+                    ddim_ratio_gen = (sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=1e-12)).squeeze()
+                    training_stats.report('CD/ddim_ratio_gen_mean', ddim_ratio_gen.mean())
+                    training_stats.report('CD/ddim_ratio_gen_min', ddim_ratio_gen.min())
+                    training_stats.report('CD/ddim_ratio_gen_median', ddim_ratio_gen.median() if ddim_ratio_gen.numel() > 0 else [])
+                    # Fraction of general edges with ratio < 0.1 (highly self-referential)
+                    frac_self_ref = (ddim_ratio_gen < 0.1).float().mean()
+                    training_stats.report('CD/ddim_frac_self_ref', frac_self_ref)
+                else:
+                    training_stats.report('CD/ddim_ratio_gen_mean', [])
+                    training_stats.report('CD/ddim_ratio_gen_min', [])
+                    training_stats.report('CD/ddim_ratio_gen_median', [])
+                    training_stats.report('CD/ddim_frac_self_ref', [])
+
+                # =========================================================================
+                # DIAGNOSTIC 9: Edge type fractions and T value (H1 context)
+                # =========================================================================
+                training_stats.report('CD/frac_terminal', torch.as_tensor(float(num_terminal) / max(num_edges, 1), device=device))
+                training_stats.report('CD/frac_boundary', torch.as_tensor(float(num_boundary) / max(num_edges, 1), device=device))
+                training_stats.report('CD/frac_general', torch.as_tensor(float(num_general) / max(num_edges, 1), device=device))
+
                 # Cache last-step diagnostics for optional per-optimizer-step logging.
                 try:
                     self._last_step_metrics = {
@@ -926,7 +1040,52 @@ class EDMConsistencyDistillLoss:
                         self._last_step_metrics['cd_grad_norm_boundary'] = None
                         self._last_step_metrics['cd_grad_norm_general'] = None
                         self._last_step_metrics['cd_grad_norm_ratio'] = None
-                        
+
+                    # DIAGNOSTIC 7: Per-sigma-bucket denoising quality
+                    self._last_step_metrics['cd_denoise_quality_all'] = float(denoise_err.mean().detach().cpu())
+                    for bname, lo, hi in zip(bucket_names, bucket_lo, bucket_hi):
+                        mask_b = (sigma_flat >= lo) & (sigma_flat < hi)
+                        self._last_step_metrics[f'cd_denoise_q_{bname}'] = float(denoise_err[mask_b].mean().detach().cpu()) if mask_b.any() else None
+
+                    # DIAGNOSTIC 8: DDIM ratio for general edges
+                    if general_mask.any():
+                        ddim_ratio_gen = (sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=1e-12)).squeeze()
+                        self._last_step_metrics['cd_ddim_ratio_gen_mean'] = float(ddim_ratio_gen.mean().detach().cpu())
+                        self._last_step_metrics['cd_ddim_ratio_gen_min'] = float(ddim_ratio_gen.min().detach().cpu())
+                        self._last_step_metrics['cd_ddim_frac_self_ref'] = float((ddim_ratio_gen < 0.1).float().mean().detach().cpu())
+                    else:
+                        self._last_step_metrics['cd_ddim_ratio_gen_mean'] = None
+                        self._last_step_metrics['cd_ddim_ratio_gen_min'] = None
+                        self._last_step_metrics['cd_ddim_frac_self_ref'] = None
+
+                    # DIAGNOSTIC 9: Edge type fractions
+                    self._last_step_metrics['cd_frac_terminal'] = float(num_terminal) / max(num_edges, 1)
+                    self._last_step_metrics['cd_frac_boundary'] = float(num_boundary) / max(num_edges, 1)
+                    self._last_step_metrics['cd_frac_general'] = float(num_general) / max(num_edges, 1)
+
+                    # #region agent log — debug instrumentation for H1/H2/H3 hypotheses
+                    try:
+                        _dbg_run_dir = getattr(self, '_run_dir', None)
+                        if _dbg_run_dir:
+                            _dbg_path = os.path.join(_dbg_run_dir, 'debug.log')
+                            _dbg_step = getattr(self, '_dbg_step_counter', 0)
+                            self._dbg_step_counter = _dbg_step + 1
+                            # Log every 50 steps to keep the file manageable
+                            if _dbg_step % 50 == 0:
+                                _dbg_payload = {
+                                    'timestamp': int(datetime.now().timestamp() * 1000),
+                                    'location': 'loss_cd.py:_last_step_metrics',
+                                    'message': 'H1/H2/H3 diagnostics',
+                                    'hypothesisId': 'H1_H2_H3',
+                                    'runId': 'initial',
+                                    'data': {k: v for k, v in self._last_step_metrics.items() if v is not None}
+                                }
+                                with open(_dbg_path, 'a') as _dbf:
+                                    _dbf.write(_json_mod.dumps(_dbg_payload) + '\n')
+                    except Exception:
+                        pass
+                    # #endregion
+
                 except Exception:
                     # Diagnostics are best-effort only; do not break training if something goes wrong.
                     self._last_step_metrics = getattr(self, '_last_step_metrics', None)
