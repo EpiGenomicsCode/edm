@@ -113,13 +113,22 @@ def training_loop(
     #   the reducer tolerates any parameters that might not participate in the
     #   backward graph on a given iteration (even though we expect the graph to
     #   be effectively fixed in practice).
+    #
+    # NOTE: You can override this for performance once you've verified there
+    # are no unused parameters:
+    #   export EDM_DDP_FIND_UNUSED_PARAMETERS=0
+    _find_unused_env = os.environ.get('EDM_DDP_FIND_UNUSED_PARAMETERS', '').strip().lower()
+    ddp_find_unused_parameters = True
+    if _find_unused_env != '':
+        ddp_find_unused_parameters = _find_unused_env not in ('0', 'false', 'no', 'off')
+    dist.print0(f'[DDP CONFIG] find_unused_parameters={ddp_find_unused_parameters} (EDM_DDP_FIND_UNUSED_PARAMETERS={_find_unused_env or "<unset>"})')
     ddp = torch.nn.parallel.DistributedDataParallel(
         net,
         device_ids=[device],
         broadcast_buffers=False,
         gradient_as_bucket_view=False,
         static_graph=False,
-        find_unused_parameters=True,
+        find_unused_parameters=ddp_find_unused_parameters,
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
