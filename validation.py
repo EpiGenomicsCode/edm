@@ -164,7 +164,14 @@ def run_fid_validation(
         bsize = len(b_idxs)
         if bsize == 0:
             continue
-        torch.distributed.barrier()
+        # NOTE: Do NOT barrier every batch by default.
+        # A per-batch barrier makes validation run in strict lockstep across all ranks,
+        # which can dramatically slow things down and can amplify minor stragglers into
+        # NCCL collective timeouts on large multi-node jobs.
+        # If you ever need it for debugging, enable explicitly:
+        #   export EDM_VAL_BARRIER_EACH_BATCH=1
+        if os.environ.get('EDM_VAL_BARRIER_EACH_BATCH', '0') == '1':
+            torch.distributed.barrier()
         local_batch_idx += 1
         if rank == 0 and (local_batch_idx == 1 or (local_batch_idx % 10 == 0) or (local_batch_idx == non_empty_rank_batches)):
             pct = 100.0 * local_batch_idx / max(non_empty_rank_batches, 1)
