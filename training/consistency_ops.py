@@ -188,9 +188,22 @@ def compute_importance_weights(
     mode: str = "vp",
     P_mean: float = -1.2,
     P_std: float = 1.2,
+    terminal_anchor: bool = True,
 ) -> torch.Tensor:
     """
     Compute importance weights for teacher edges based on sampling mode.
+    
+    When terminal_anchor is True, the terminal edge (σ_min → 0) is carved out
+    of the IS distribution and given a fixed probability of 1/T — matching the
+    MSCD paper's uniform treatment.  The remaining T-1 non-terminal edges share
+    (1 - 1/T) of the probability according to their IS weights.
+    
+    Rationale: the terminal edge anchors the model to clean data (target = x),
+    preventing degenerate solutions (MSCD paper §3).  The Karras grid treats
+    each edge as equally important (uniform in σ^{1/ρ}), so 1/T is the
+    natural, principled rate.  IS distributions (log-normal, VP) assign near-
+    zero density at σ_min, effectively disabling this anchor — which is why
+    we carve it out explicitly.
     
     Args:
         teacher_sigmas: FloatTensor of shape (T+1,) with terminal 0
@@ -205,46 +218,46 @@ def compute_importance_weights(
                    Gives ~82% in [0.1, 10] with default P_mean=-1.2, P_std=1.2
         P_mean: Mean of log-normal (only used if mode="edm"), default -1.2
         P_std: Std of log-normal (only used if mode="edm"), default 1.2
+        terminal_anchor: If True (default), the terminal edge (last positive
+            sigma) gets exactly 1/T probability, matching the MSCD paper's
+            uniform rate.  IS governs only the T-1 non-terminal edges.
     
     Returns:
         weights: FloatTensor of shape (T,) normalized to sum to 1
     """
-    import math
-    
     # Exclude terminal 0
     sigmas = teacher_sigmas[:-1].float()
     T = len(sigmas)
     
     if mode == "uniform":
-        # Equal weights
         weights = torch.ones(T, device=sigmas.device, dtype=torch.float32)
     
     elif mode == "vp":
-        # VP/MSCD uniform-t: w(σ) = σ^(1-1/ρ) / (1+σ²)
-        # This transforms Karras grid (uniform in σ^(1/ρ)) to VP's uniform-t
         exponent = 1.0 - 1.0 / rho
         weights = (sigmas + 1e-10) ** exponent / (1.0 + sigmas ** 2)
     
     elif mode == "edm":
-        # EDM's log-normal: p(σ) ∝ (1/σ) * exp(-(ln(σ) - P_mean)² / (2*P_std²))
-        # But we need importance weights relative to Karras grid density
-        # Karras density: p_karras(σ) ∝ σ^(1/ρ - 1)
-        # So: w(σ) = p_edm(σ) / p_karras(σ)
-        #          ∝ [1/σ * exp(...)] / [σ^(1/ρ - 1)]
-        #          = σ^(-1/ρ) * exp(-(ln(σ) - P_mean)² / (2*P_std²))
         log_sigmas = torch.log(sigmas + 1e-10)
         log_prob = -0.5 * ((log_sigmas - P_mean) / P_std) ** 2
-        # Importance weight = p_edm / p_karras
-        # p_edm ∝ (1/σ) * exp(log_prob)
-        # p_karras ∝ σ^(1/ρ - 1)
-        # w = (1/σ) * exp(log_prob) / σ^(1/ρ - 1) = σ^(-1/ρ) * exp(log_prob)
         weights = (sigmas + 1e-10) ** (-1.0 / rho) * torch.exp(log_prob)
     
     else:
         raise ValueError(f"Unknown sampling mode: {mode}. Use 'uniform', 'vp', or 'edm'.")
     
-    # Normalize
+    # Normalize IS weights to sum to 1
     weights = weights / weights.sum().clamp(min=1e-10)
+    
+    # Terminal anchor: carve out 1/T for the terminal edge (last in grid).
+    # The terminal edge (σ_min → 0) is NOT part of the IS distribution; it's
+    # a fixed-probability anchor to clean data.  IS governs only the T-1
+    # non-terminal edges, which share the remaining (1 - 1/T) probability.
+    if terminal_anchor and T > 1 and mode != "uniform":
+        target_p = 1.0 / 40
+        non_term = weights[:-1]
+        non_term_sum = non_term.sum().clamp(min=1e-10)
+        weights[:-1] = non_term * (1.0 - target_p) / non_term_sum
+        weights[-1] = target_p
+    
     return weights
 
 
@@ -262,6 +275,7 @@ def sample_segment_and_teacher_pair(
     rho: float = 7.0,
     P_mean: float = -1.2,
     P_std: float = 1.2,
+    terminal_anchor: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
     Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
@@ -325,7 +339,8 @@ def sample_segment_and_teacher_pair(
     use_importance = sampling_mode in ("vp", "edm")
     if use_importance:
         edge_weights = compute_importance_weights(
-            teacher_sigmas, rho, mode=sampling_mode, P_mean=P_mean, P_std=P_std
+            teacher_sigmas, rho, mode=sampling_mode, P_mean=P_mean, P_std=P_std,
+            terminal_anchor=terminal_anchor,
         ).to(device)
     else:
         edge_weights = None

@@ -72,6 +72,7 @@ def parse_int_list(s):
 @click.option('--cd_target_mode', help='Target network for sigma_s denoiser: live|ema|teacher', metavar='STR', type=click.Choice(['live', 'ema', 'teacher']), default='live', show_default=True)
 @click.option('--cd_target_ema', help='EMA rate for target network (only used if cd_target_mode=ema)', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.95, show_default=True)
 @click.option('--sampling_mode', help='Edge sampling distribution: uniform|vp (MSCD)|edm (log-normal)', metavar='STR', type=click.Choice(['uniform', 'vp', 'edm']), default='vp', show_default=True)
+@click.option('--terminal_anchor/--no_terminal_anchor', help='Anchor terminal edge (σ_min→0) to 1/T probability matching MSCD paper', default=True, show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -233,6 +234,7 @@ def main(**kwargs):
             loss_type=opts.cd_loss,
             weight_mode=opts.cd_weight_mode,
             sampling_mode=opts.sampling_mode,
+            terminal_anchor=opts.terminal_anchor,
         )
         # Provenance and optional eval knob (stored only).
         c.teacher = opts.teacher

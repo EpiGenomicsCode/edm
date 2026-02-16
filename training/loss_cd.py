@@ -122,6 +122,7 @@ class EDMConsistencyDistillLoss:
         target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA or teacher)
         anchor_by_sigma: bool = True,   # If True, segment teacher edges in sigma-space (closest-to-boundary first)
         sampling_mode: str = "vp",  # Edge sampling: "uniform" | "vp" (MSCD uniform-t) | "edm" (log-normal)
+        terminal_anchor: bool = True,  # Anchor terminal edge to 1/T probability (matches MSCD paper)
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
@@ -164,6 +165,7 @@ class EDMConsistencyDistillLoss:
         self.anchor_by_sigma = bool(anchor_by_sigma)
         assert sampling_mode in ("uniform", "vp", "edm"), f"Invalid sampling_mode: {sampling_mode}"
         self.sampling_mode = sampling_mode
+        self.terminal_anchor = bool(terminal_anchor)
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -417,6 +419,7 @@ class EDMConsistencyDistillLoss:
             terminal_k=terminal_k,
             sampling_mode=self.sampling_mode,
             rho=self.rho,
+            terminal_anchor=self.terminal_anchor,
         )
 
         # -------------------------------------------------------------------------------------
@@ -551,12 +554,12 @@ class EDMConsistencyDistillLoss:
 
         # Compute inv-DDIM target at t using per-sample sigma_ref (PRD §4.2.6)
         try:
-            x_hat_t_star = inv_ddim_edm(
-                x_ref=x_ref_bdry,
-                x_t=x_t,
-                sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
-                sigma_ref=sigma_ref_vec,  # [N]
-            ).to(torch.float32)
+        x_hat_t_star = inv_ddim_edm(
+            x_ref=x_ref_bdry,
+            x_t=x_t,
+            sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
+            sigma_ref=sigma_ref_vec,  # [N]
+        ).to(torch.float32)
         except ValueError as e:
             # Add sampling context to the error message
             error_msg = str(e) + "\n\n  Sampling context for affected samples (first 5):\n"
@@ -636,7 +639,7 @@ class EDMConsistencyDistillLoss:
         else:
             # "l2": elementwise squared error (matches prior behavior)
             per_elem = diff * diff
-            loss = weight * per_elem
+        loss = weight * per_elem
 
         # Update edge statistics (per-sample counts) (PRD §4.2.8)
         num_terminal = int(is_terminal.sum().item())
@@ -697,7 +700,7 @@ class EDMConsistencyDistillLoss:
                 loss_mean_per_sample = loss.mean(dim=(1, 2, 3))  # [N]
                 training_stats.report('CD/loss_mean', loss_mean_per_sample.mean())
                 training_stats.report('CD/loss_gain_corr', (gain * loss_mean_per_sample).mean())
-                
+
                 # =========================================================================
                 # DIAGNOSTIC 0: Loss spike analysis
                 # =========================================================================
@@ -740,7 +743,7 @@ class EDMConsistencyDistillLoss:
                     
                     # Weight (EDM weighting) of spike samples — are high-weight samples spiking?
                     training_stats.report('CD/spike_weight_mean', weight.view(-1)[is_spike].mean())
-                else:
+        else:
                     # Report zeros / empty so stat names stay consistent
                     training_stats.report('CD/spike_loss_mean', [])
                     training_stats.report('CD/spike_loss_max', [])
@@ -792,7 +795,7 @@ class EDMConsistencyDistillLoss:
                 # DIAGNOSTIC 2 & 3: Teacher vs Student output comparison
                 # =========================================================================
                 # Compute teacher's denoised estimate at sigma_t for ALL samples (single forward pass)
-                with torch.no_grad():
+        with torch.no_grad():
                     x_hat_t_teacher = self.teacher_net(
                         x_t,
                         sigma_t_vec,
@@ -879,7 +882,7 @@ class EDMConsistencyDistillLoss:
                     diff_target_gt = x_hat_t_star[idx_b] - y[idx_b]
                     target_gt_div = torch.sqrt((diff_target_gt * diff_target_gt).sum(dim=[1, 2, 3]).clamp(min=1e-12))
                     training_stats.report('CD/target_gt_div_boundary', target_gt_div.mean())
-                else:
+        else:
                     training_stats.report('CD/target_teacher_div_boundary', [])
                     training_stats.report('CD/target_gt_div_boundary', [])
                 
@@ -909,7 +912,7 @@ class EDMConsistencyDistillLoss:
                     training_stats.report('CD/grad_norm_boundary', boundary_grad_norm)
                     training_stats.report('CD/grad_norm_general', general_grad_norm)
                     training_stats.report('CD/grad_norm_ratio_boundary_general', boundary_grad_norm / (general_grad_norm + 1e-12))
-                else:
+            else:
                     training_stats.report('CD/grad_conflict_boundary_general', [])
                     training_stats.report('CD/grad_norm_boundary', [])
                     training_stats.report('CD/grad_norm_general', [])
@@ -929,7 +932,7 @@ class EDMConsistencyDistillLoss:
                     mask_b = (sigma_flat >= lo) & (sigma_flat < hi)
                     if mask_b.any():
                         training_stats.report(f'CD/denoise_q_{bname}', denoise_err[mask_b].mean())
-                    else:
+                else:
                         training_stats.report(f'CD/denoise_q_{bname}', [])
 
                 # Overall denoising quality
@@ -948,7 +951,7 @@ class EDMConsistencyDistillLoss:
                     # Fraction of general edges with ratio < 0.1 (highly self-referential)
                     frac_self_ref = (ddim_ratio_gen < 0.1).float().mean()
                     training_stats.report('CD/ddim_frac_self_ref', frac_self_ref)
-                else:
+            else:
                     training_stats.report('CD/ddim_ratio_gen_mean', [])
                     training_stats.report('CD/ddim_ratio_gen_min', [])
                     training_stats.report('CD/ddim_ratio_gen_median', [])
@@ -1011,7 +1014,7 @@ class EDMConsistencyDistillLoss:
                         self._last_step_metrics['cd_spike_gain_max'] = float(gain[is_spike].max().detach().cpu())
                         self._last_step_metrics['cd_spike_seg_id_mean'] = float(j[is_spike].float().mean().detach().cpu())
                         self._last_step_metrics['cd_spike_weight_mean'] = float(weight.view(-1)[is_spike].mean().detach().cpu())
-                    else:
+        else:
                         self._last_step_metrics['cd_spike_loss_mean'] = None
                         self._last_step_metrics['cd_spike_loss_max'] = None
                         self._last_step_metrics['cd_spike_pct_terminal'] = None
@@ -1035,7 +1038,7 @@ class EDMConsistencyDistillLoss:
                         self._last_step_metrics['cd_grad_norm_boundary'] = float(boundary_grad_norm.detach().cpu())
                         self._last_step_metrics['cd_grad_norm_general'] = float(general_grad_norm.detach().cpu())
                         self._last_step_metrics['cd_grad_norm_ratio'] = float((boundary_grad_norm / (general_grad_norm + 1e-12)).detach().cpu())
-                    else:
+                else:
                         self._last_step_metrics['cd_grad_conflict'] = None
                         self._last_step_metrics['cd_grad_norm_boundary'] = None
                         self._last_step_metrics['cd_grad_norm_general'] = None
@@ -1053,7 +1056,7 @@ class EDMConsistencyDistillLoss:
                         self._last_step_metrics['cd_ddim_ratio_gen_mean'] = float(ddim_ratio_gen.mean().detach().cpu())
                         self._last_step_metrics['cd_ddim_ratio_gen_min'] = float(ddim_ratio_gen.min().detach().cpu())
                         self._last_step_metrics['cd_ddim_frac_self_ref'] = float((ddim_ratio_gen < 0.1).float().mean().detach().cpu())
-                    else:
+                else:
                         self._last_step_metrics['cd_ddim_ratio_gen_mean'] = None
                         self._last_step_metrics['cd_ddim_ratio_gen_min'] = None
                         self._last_step_metrics['cd_ddim_frac_self_ref'] = None
