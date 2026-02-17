@@ -554,12 +554,12 @@ class EDMConsistencyDistillLoss:
 
         # Compute inv-DDIM target at t using per-sample sigma_ref (PRD §4.2.6)
         try:
-        x_hat_t_star = inv_ddim_edm(
-            x_ref=x_ref_bdry,
-            x_t=x_t,
-            sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
-            sigma_ref=sigma_ref_vec,  # [N]
-        ).to(torch.float32)
+            x_hat_t_star = inv_ddim_edm(
+                x_ref=x_ref_bdry,
+                x_t=x_t,
+                sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
+                sigma_ref=sigma_ref_vec,  # [N]
+            ).to(torch.float32)
         except ValueError as e:
             # Add sampling context to the error message
             error_msg = str(e) + "\n\n  Sampling context for affected samples (first 5):\n"
