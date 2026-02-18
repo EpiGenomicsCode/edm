@@ -123,6 +123,7 @@ class EDMConsistencyDistillLoss:
         anchor_by_sigma: bool = True,   # If True, segment teacher edges in sigma-space (closest-to-boundary first)
         sampling_mode: str = "vp",  # Edge sampling: "uniform" | "vp" (MSCD uniform-t) | "edm" (log-normal)
         terminal_anchor: bool = True,  # Anchor terminal edge to 1/T probability (matches MSCD paper)
+        terminal_teacher_hop: bool = False,  # Use teacher Euler hop for terminal edge instead of clean image y
     ):
         assert S >= 2, "Student steps S must be >= 2"
         assert T_start >= 2 and T_end >= T_start
@@ -166,6 +167,7 @@ class EDMConsistencyDistillLoss:
         assert sampling_mode in ("uniform", "vp", "edm"), f"Invalid sampling_mode: {sampling_mode}"
         self.sampling_mode = sampling_mode
         self.terminal_anchor = bool(terminal_anchor)
+        self.terminal_teacher_hop = bool(terminal_teacher_hop)
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -507,8 +509,22 @@ class EDMConsistencyDistillLoss:
                 )
             x_s_teach[idx] = x_s_teach_nt
         
-        # Terminal edges: anchor to clean input, σ_ref = 0
-        x_ref_bdry[is_terminal] = y[is_terminal].to(torch.float32)
+        # Terminal edges: σ_ref = 0.
+        # Default: anchor to ground-truth clean image y.
+        # With terminal_teacher_hop: use teacher's Euler step from σ_min→0,
+        # which equals D_teacher(x_t, σ_min). This matches the actual sampling
+        # chain (generate.py: last step is Euler-only since Heun's 2nd-order
+        # correction divides by t_next=0).
+        if self.terminal_teacher_hop and is_terminal.any():
+            with torch.no_grad():
+                x_ref_bdry[is_terminal] = self.teacher_net(
+                    x_t[is_terminal],
+                    sigma_t_vec[is_terminal],
+                    labels[is_terminal] if labels is not None else None,
+                    augment_labels=augment_labels[is_terminal] if augment_labels is not None else None,
+                ).to(torch.float32)
+        else:
+            x_ref_bdry[is_terminal] = y[is_terminal].to(torch.float32)
         sigma_ref_vec[is_terminal] = 0.0
         
         # Boundary snap edges: reference is teacher hop, σ_ref = σ_s_eff
