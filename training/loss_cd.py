@@ -2,12 +2,24 @@ import math
 import os
 import copy
 import json as _json_mod
+import time as _time_mod
 from typing import Optional, Tuple, Dict, List, Any
 from datetime import datetime
 
 import torch
 from torch_utils import persistence
 from torch_utils import training_stats
+
+# #region agent log — timing helper for loss_cd bottleneck investigation
+_LCD_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.cursor', 'debug.log')
+def _lcd_log(loc, msg, data, hyp='H1'):
+    try:
+        payload = {'timestamp': int(_time_mod.time()*1000), 'location': loc, 'message': msg, 'hypothesisId': hyp, 'runId': 'perf', 'data': data}
+        with open(_LCD_LOG_PATH, 'a') as f:
+            f.write(_json_mod.dumps(payload) + '\n')
+    except Exception:
+        pass
+# #endregion
 
 from .consistency_ops import (
     make_karras_sigmas,
@@ -354,6 +366,9 @@ class EDMConsistencyDistillLoss:
         # Optional augmentation (matches other losses).
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
 
+        # #region agent log — time grid building + filter (H2)
+        _t_grid_start = _time_mod.time()
+        # #endregion
         # Build grids with terminal zeros.
         student_sigmas = self._build_student_grid(net=net, device=device)  # [S+1] with terminal 0
 
@@ -369,6 +384,9 @@ class EDMConsistencyDistillLoss:
         else:
             teacher_sigmas = teacher_sigmas_full
             terminal_k = teacher_sigmas.shape[0] - 2  # last positive before terminal 0
+        # #region agent log — grid done
+        _t_grid_elapsed = _time_mod.time() - _t_grid_start
+        # #endregion
 
         # Now everything below uses the (maybe filtered) teacher_sigmas
         T_edges = teacher_sigmas.shape[0] - 1  # number of edges in CD grid
@@ -673,6 +691,9 @@ class EDMConsistencyDistillLoss:
         self._count_boundary_match += num_boundary
         self._count_general_edges += num_general
 
+        # #region agent log — time entire stats block
+        _t_stats_start = _time_mod.time()
+        # #endregion
         # Training stats reporting: batch means (PRD §4.2.9)
         if self.enable_stats:
             with torch.no_grad():
@@ -810,6 +831,9 @@ class EDMConsistencyDistillLoss:
                 # =========================================================================
                 # DIAGNOSTIC 2 & 3: Teacher vs Student output comparison
                 # =========================================================================
+                # #region agent log — time DIAGNOSTIC teacher fwd pass (H1 — CRITICAL)
+                _t_diag_teacher_start = _time_mod.time()
+                # #endregion
                 # Compute teacher's denoised estimate at sigma_t for ALL samples (single forward pass)
                 with torch.no_grad():
                     x_hat_t_teacher = self.teacher_net(
@@ -818,6 +842,10 @@ class EDMConsistencyDistillLoss:
                         labels,
                         augment_labels=augment_labels,
                     ).to(torch.float32)
+                # #region agent log — diagnostic teacher fwd done
+                torch.cuda.synchronize(device)
+                _t_diag_teacher_elapsed = _time_mod.time() - _t_diag_teacher_start
+                # #endregion
                 
                 # Student-Teacher divergence at sigma_t (per-sample)
                 diff_st = x_hat_t - x_hat_t_teacher
@@ -1109,6 +1137,27 @@ class EDMConsistencyDistillLoss:
                     # Diagnostics are best-effort only; do not break training if something goes wrong.
                     self._last_step_metrics = getattr(self, '_last_step_metrics', None)
 
+        # #region agent log — stats block done; log timing every 10 calls
+        _t_stats_elapsed = _time_mod.time() - _t_stats_start
+        _lcd_call_count = getattr(self, '_lcd_call_count', 0)
+        self._lcd_call_count = _lcd_call_count + 1
+        if _lcd_call_count % 10 == 0:
+            _diag_teacher_t = getattr(self, '_last_diag_teacher_t', 0.0)
+            # Capture if available (only set when enable_stats=True)
+            try:
+                _diag_teacher_t = _t_diag_teacher_elapsed
+            except NameError:
+                _diag_teacher_t = -1
+            _lcd_log('loss_cd.py:__call__:timing', 'forward_pass_timing', {
+                'call': _lcd_call_count,
+                'grid_build_s': round(_t_grid_elapsed, 5),
+                'stats_block_s': round(_t_stats_elapsed, 5),
+                'diag_teacher_fwd_s': round(_diag_teacher_t, 5),
+                'batch_size': batch_size,
+                'T_edges': int(T_edges),
+                'enable_stats': self.enable_stats,
+            }, hyp='H1_H2')
+        # #endregion
         return loss
 
 

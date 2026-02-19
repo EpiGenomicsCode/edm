@@ -21,6 +21,20 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
 
+# #region agent log — timing helpers for CPU/GPU bottleneck investigation
+_DBG_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.cursor', 'debug.log')
+_DBG_STEP = [0]
+def _dbg_log(loc, msg, data, hyp='H_ALL'):
+    try:
+        import json as _j
+        payload = {'timestamp': int(time.time()*1000), 'location': loc, 'message': msg, 'hypothesisId': hyp, 'runId': 'perf', 'data': data}
+        os.makedirs(os.path.dirname(_DBG_LOG_PATH), exist_ok=True)
+        with open(_DBG_LOG_PATH, 'a') as f:
+            f.write(_j.dumps(payload) + '\n')
+    except Exception:
+        pass
+# #endregion
+
 # Validation hook.
 from validation import maybe_validate, run_fid_validation
 
@@ -350,22 +364,46 @@ def training_loop(
         if os.environ.get('CD_DDP_DEBUG'):
             print(f'[RANK {dist.get_rank()}] zero_grad', flush=True)
         optimizer.zero_grad(set_to_none=True)
+        # #region agent log — per-step timing instrumentation (H1-H5)
+        _t_step_start = time.time()
+        _t_data_total = 0; _t_loss_total = 0; _t_backward_total = 0
+        # #endregion
         for round_idx in range(num_accumulation_rounds):
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] round {round_idx}: fetching batch', flush=True)
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
+                # #region agent log — time data loading (H3)
+                _t0 = time.time()
+                # #endregion
                 images, labels = next(dataset_iterator)
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: batch fetched, moving to device', flush=True)
                 images = images.to(device).to(torch.float32) / 127.5 - 1
                 labels = labels.to(device)
+                # #region agent log — data load done
+                _t_data_total += time.time() - _t0
+                # #endregion
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: calling loss_fn', flush=True)
+                # #region agent log — time loss forward (H1, H2)
+                _t0 = time.time()
+                # #endregion
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+                # #region agent log — loss forward done
+                torch.cuda.synchronize(device)
+                _t_loss_total += time.time() - _t0
+                # #endregion
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: loss computed, calling backward', flush=True)
                 training_stats.report('Loss/loss', loss)
+                # #region agent log — time backward (H5)
+                _t0 = time.time()
+                # #endregion
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                # #region agent log — backward done
+                torch.cuda.synchronize(device)
+                _t_backward_total += time.time() - _t0
+                # #endregion
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: backward done', flush=True)
                 try:
@@ -379,6 +417,9 @@ def training_loop(
         # Capture the effective LR for this step (assume a single scalar LR across params).
         current_lr = optimizer.param_groups[0]['lr']
 
+        # #region agent log — time grad norm computation (H4)
+        _t_grad_start = time.time()
+        # #endregion
         # Sanitize gradients and compute global norms (per optimizer step).
         total_grad_sq = torch.zeros([], device=device)
         total_param_sq = torch.zeros([], device=device)
@@ -397,7 +438,20 @@ def training_loop(
         training_stats.report('Grad/global_norm', grad_global_norm)
         training_stats.report('Grad/param_norm', param_global_norm)
         training_stats.report('Grad/update_over_param', true_update_over_param)
+        # #region agent log — grad norm done
+        torch.cuda.synchronize(device)
+        _t_grad_elapsed = time.time() - _t_grad_start
+        # #endregion
+        # #region agent log — time optimizer step
+        _t_opt_start = time.time()
+        # #endregion
         optimizer.step()
+        # #region agent log — optimizer step done
+        _t_opt_elapsed = time.time() - _t_opt_start
+        # #endregion
+        # #region agent log — time per-step logging (H3)
+        _t_log_start = time.time()
+        # #endregion
         # Per-optimizer-step diagnostics (rank 0 only, written to step_stats.jsonl and W&B).
         if dist.get_rank() == 0:
             if step_stats_jsonl is None and run_dir is not None:
@@ -509,7 +563,13 @@ def training_loop(
                 except Exception as _e:
                     dist.print0(f'[W&B] per-step log failed: {_e}')
         cur_step += 1
+        # #region agent log — per-step logging done
+        _t_log_elapsed = time.time() - _t_log_start
+        # #endregion
 
+        # #region agent log — time EMA update
+        _t_ema_start = time.time()
+        # #endregion
         # Update EMA (validation/snapshot EMA).
         ema_halflife_nimg = ema_halflife_kimg * 1000
         if ema_rampup_ratio is not None:
@@ -518,6 +578,25 @@ def training_loop(
         for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
         ema_updates += 1
+        # #region agent log — EMA done
+        _t_ema_elapsed = time.time() - _t_ema_start
+        _t_step_total = time.time() - _t_step_start
+        # Log timing every 5 steps, only on rank 0
+        _DBG_STEP[0] += 1
+        if _DBG_STEP[0] % 5 == 0 and dist.get_rank() == 0:
+            _dbg_log('training_loop.py:inner_loop', 'step_timing', {
+                'step': _DBG_STEP[0], 'rank': dist.get_rank(), 'world_size': dist.get_world_size(),
+                'total_s': round(_t_step_total, 4),
+                'data_load_s': round(_t_data_total, 4),
+                'loss_fwd_s': round(_t_loss_total, 4),
+                'backward_s': round(_t_backward_total, 4),
+                'grad_norm_s': round(_t_grad_elapsed, 4),
+                'optimizer_s': round(_t_opt_elapsed, 4),
+                'logging_s': round(_t_log_elapsed, 4),
+                'ema_s': round(_t_ema_elapsed, 4),
+                'accum_rounds': num_accumulation_rounds,
+            }, hyp='H_ALL')
+        # #endregion
         
         # Update target EMA (for CD sigma_s denoiser, OpenAI CM style).
         # This uses a fixed EMA rate (no rampup), matching OpenAI's "fixed" mode.
