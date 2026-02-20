@@ -6,6 +6,7 @@ from typing import Callable, Dict
 
 import torch
 
+# Scale up to multiple GPUs by measuring time logs
 # #region agent log — timing helper for consistency_ops
 _COP_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.cursor', 'debug.log')
 _COP_CALL_COUNT = [0]
@@ -19,6 +20,7 @@ def _cop_log(loc, msg, data, hyp='H2'):
 # #endregion
 
 
+
 @torch.no_grad()
 def make_karras_sigmas(
     num_nodes: int,
@@ -28,6 +30,7 @@ def make_karras_sigmas(
     round_fn: Callable[[torch.Tensor], torch.Tensor],
 ) -> torch.Tensor:
     """
+    Create the grid for noise schedule during inference and training.
     Construct a monotonically descending Karras noise grid (length = num_nodes) in EDM space.
     Does not append 0; consumers treat 0 as a conceptual boundary.
     Each sigma is passed through `round_fn` (e.g., `net.round_sigma`) to align with network rounding.
@@ -43,6 +46,7 @@ def make_karras_sigmas(
     sigma_min_r = float(sigma_min)
     sigma_max_r = float(sigma_max)
     rho_r = float(rho)
+    # schedule polynomial
     sigmas = (sigma_max_r ** (1.0 / rho_r) + step_indices / max(num_nodes - 1, 1) * (sigma_min_r ** (1.0 / rho_r) - sigma_max_r ** (1.0 / rho_r))) ** rho_r
     # Apply network's rounding to keep consistency with training/inference.
     sigmas = round_fn(sigmas)
@@ -51,6 +55,7 @@ def make_karras_sigmas(
 
 def partition_edges_into_segments(T: int, S: int) -> torch.Tensor:
     """
+    Assign edges (segments between teacher grids) to student-anchored segment boundaries (segments between student grids).
     Student-anchored segment boundaries for consistency distillation (index-based).
     
     Returns boundaries[j] = round(j * T / S) with ties going up,
@@ -223,6 +228,8 @@ def compute_importance_weights(
 ) -> torch.Tensor:
     """
     Compute importance weights for teacher edges based on sampling mode.
+    Sample images at different noise levels corresponding to segments being sample.
+    Sample them according to log distribution for
     
     When terminal_anchor is True, the terminal edge (σ_min → 0) is carved out
     of the IS distribution and given a fixed probability of 1/T — matching the
@@ -310,6 +317,8 @@ def sample_segment_and_teacher_pair(
 ) -> Dict[str, torch.Tensor]:
     """
     Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
+        k-t left time stamp (smaller noise level) for calculating consistency loss.
+        k-s right time stamp (larger noise level) for calculating consistency loss.
     
     **Per-sample edge sampling**: Each element in the batch independently draws its own
     edge (j, k_t, k_s) and corresponding sigmas. All returned tensors have shape [batch_size]

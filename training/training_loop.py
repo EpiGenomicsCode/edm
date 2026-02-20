@@ -601,7 +601,9 @@ def training_loop(
         # Update target EMA (for CD sigma_s denoiser, OpenAI CM style).
         # This uses a fixed EMA rate (no rampup), matching OpenAI's "fixed" mode.
         if target_ema_net is not None:
-            target_ema_beta = cd_target_ema  # e.g., 0.95
+            # target_ema_beta = cd_target_ema  # e.g., 0.95
+            # Use dynamic decay rate based on current N(k)
+            target_ema_beta = math.exp((loss_fn.T_start * math.log(cd_target_ema)) / loss_fn._current_T_edges())
             for p_target, p_net in zip(target_ema_net.parameters(), net.parameters()):
                 p_target.mul_(target_ema_beta).add_(p_net.detach(), alpha=1 - target_ema_beta)
             # Update the loss function's reference to the target network.
