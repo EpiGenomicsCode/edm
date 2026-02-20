@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=18:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
 
@@ -53,9 +53,9 @@ export LOCAL_RANK=0
 # Run training with torchrun and arguments per prompt
 torchrun --standalone --nproc_per_node=4 train.py \
   --outdir=training-runs/imagenet64-cd-s8 \
-  --data=datasets/imagenet-64x64.zip \
+  --data=/work/nvme/bbse/vmathew/edm_training/edm/datasets/imagenet-64x64.zip \
   --cond=1 --arch=adm --precond=edm \
-  --batch=2048 --batch-gpu=128 --fp16=True --ema=14 --lr=2e-5 --ema_rampup=0 \
+  --batch=2048 --batch-gpu=128 --fp16=True --ema=50 --lr=2e-5 --ema_rampup=0.05 \
   --consistency=True \
   --sampling_mode=edm \
   --duration=410 \
