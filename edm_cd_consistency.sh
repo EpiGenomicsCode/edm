@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=48:00:00
+#SBATCH --time=18:00:00
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
 
