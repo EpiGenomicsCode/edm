@@ -906,107 +906,70 @@ class EDMConsistencyDistillLoss:
                 training_stats.report('CD/frac_general', torch.as_tensor(float(num_general) / max(num_edges, 1), device=device))
 
                 # Cache last-step diagnostics for optional per-optimizer-step logging.
+                # FIX H2: only build when the training loop sets
+                # _collect_step_metrics=True, avoiding 30+ GPU→CPU syncs per
+                # forward call on non-metric steps.
                 try:
-                    self._last_step_metrics = {
-                        # Original gain metrics
-                        'cd_gain_mean': float(gain.mean().detach().cpu()),
-                        'cd_gain_max': float(gain.max().detach().cpu()),
-                        'cd_gain_95p': float(gain.quantile(0.95).detach().cpu()),
-                        'cd_gain_99p': float(gain.quantile(0.99).detach().cpu()),
-                        'cd_gain_terminal_mean': float(gain_terminal.mean().detach().cpu()) if gain_terminal.numel() > 0 else None,
-                        'cd_gain_boundary_mean': float(gain_boundary.mean().detach().cpu()) if gain_boundary.numel() > 0 else None,
-                        'cd_gain_general_mean': float(gain_general.mean().detach().cpu()) if gain_general.numel() > 0 else None,
-                        'cd_loss_mean': float(loss_mean_per_sample.mean().detach().cpu()),
-                        'cd_loss_gain_corr': float((gain * loss_mean_per_sample).mean().detach().cpu()),
-                        
-                        # DIAGNOSTIC 1: Per-edge L2 error
-                        'cd_l2_error_all': float(per_sample_l2_sqrt.mean().detach().cpu()),
-                        'cd_l2_error_terminal': float(l2_terminal.mean().detach().cpu()) if l2_terminal.numel() > 0 else None,
-                        'cd_l2_error_boundary': float(l2_boundary.mean().detach().cpu()) if l2_boundary.numel() > 0 else None,
-                        'cd_l2_error_general': float(l2_general.mean().detach().cpu()) if l2_general.numel() > 0 else None,
-                        
-                        # DIAGNOSTIC 4: Gradient fraction
-                        'cd_grad_frac_terminal': float((terminal_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
-                        'cd_grad_frac_boundary': float((boundary_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
-                        'cd_grad_frac_general': float((general_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
-                    }
-                    
-                    # DIAGNOSTIC 0: Loss spike analysis
-                    self._last_step_metrics['cd_spike_count'] = num_spikes
-                    self._last_step_metrics['cd_spike_frac'] = float(num_spikes) / max(batch_size, 1)
-                    if num_spikes > 0:
-                        self._last_step_metrics['cd_spike_loss_mean'] = float(spike_losses.mean().detach().cpu())
-                        self._last_step_metrics['cd_spike_loss_max'] = float(spike_losses.max().detach().cpu())
-                        spike_terminal = (is_spike & is_terminal).sum().float()
-                        spike_boundary = (is_spike & is_boundary_snap).sum().float()
-                        spike_general  = (is_spike & general_mask).sum().float()
-                        self._last_step_metrics['cd_spike_pct_terminal'] = float(spike_terminal / max(num_spikes, 1))
-                        self._last_step_metrics['cd_spike_pct_boundary'] = float(spike_boundary / max(num_spikes, 1))
-                        self._last_step_metrics['cd_spike_pct_general'] = float(spike_general / max(num_spikes, 1))
-                        self._last_step_metrics['cd_spike_sigma_t_mean'] = float(sigma_t_vec[is_spike].mean().detach().cpu())
-                        self._last_step_metrics['cd_spike_gain_mean'] = float(gain[is_spike].mean().detach().cpu())
-                        self._last_step_metrics['cd_spike_gain_max'] = float(gain[is_spike].max().detach().cpu())
-                        self._last_step_metrics['cd_spike_seg_id_mean'] = float(j[is_spike].float().mean().detach().cpu())
-                        self._last_step_metrics['cd_spike_weight_mean'] = float(weight.view(-1)[is_spike].mean().detach().cpu())
+                    if getattr(self, '_collect_step_metrics', False):
+                        self._last_step_metrics = {
+                            'cd_gain_mean': float(gain.mean().detach().cpu()),
+                            'cd_gain_max': float(gain.max().detach().cpu()),
+                            'cd_gain_95p': float(gain.quantile(0.95).detach().cpu()),
+                            'cd_gain_99p': float(gain.quantile(0.99).detach().cpu()),
+                            'cd_gain_terminal_mean': float(gain_terminal.mean().detach().cpu()) if gain_terminal.numel() > 0 else None,
+                            'cd_gain_boundary_mean': float(gain_boundary.mean().detach().cpu()) if gain_boundary.numel() > 0 else None,
+                            'cd_gain_general_mean': float(gain_general.mean().detach().cpu()) if gain_general.numel() > 0 else None,
+                            'cd_loss_mean': float(loss_mean_per_sample.mean().detach().cpu()),
+                            'cd_loss_gain_corr': float((gain * loss_mean_per_sample).mean().detach().cpu()),
+                            'cd_l2_error_all': float(per_sample_l2_sqrt.mean().detach().cpu()),
+                            'cd_l2_error_terminal': float(l2_terminal.mean().detach().cpu()) if l2_terminal.numel() > 0 else None,
+                            'cd_l2_error_boundary': float(l2_boundary.mean().detach().cpu()) if l2_boundary.numel() > 0 else None,
+                            'cd_l2_error_general': float(l2_general.mean().detach().cpu()) if l2_general.numel() > 0 else None,
+                            'cd_grad_frac_terminal': float((terminal_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
+                            'cd_grad_frac_boundary': float((boundary_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
+                            'cd_grad_frac_general': float((general_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
+                        }
+                        self._last_step_metrics['cd_spike_count'] = num_spikes
+                        self._last_step_metrics['cd_spike_frac'] = float(num_spikes) / max(batch_size, 1)
+                        if num_spikes > 0:
+                            self._last_step_metrics['cd_spike_loss_mean'] = float(spike_losses.mean().detach().cpu())
+                            self._last_step_metrics['cd_spike_loss_max'] = float(spike_losses.max().detach().cpu())
+                            spike_terminal = (is_spike & is_terminal).sum().float()
+                            spike_boundary = (is_spike & is_boundary_snap).sum().float()
+                            spike_general  = (is_spike & general_mask).sum().float()
+                            self._last_step_metrics['cd_spike_pct_terminal'] = float(spike_terminal / max(num_spikes, 1))
+                            self._last_step_metrics['cd_spike_pct_boundary'] = float(spike_boundary / max(num_spikes, 1))
+                            self._last_step_metrics['cd_spike_pct_general'] = float(spike_general / max(num_spikes, 1))
+                            self._last_step_metrics['cd_spike_sigma_t_mean'] = float(sigma_t_vec[is_spike].mean().detach().cpu())
+                            self._last_step_metrics['cd_spike_gain_mean'] = float(gain[is_spike].mean().detach().cpu())
+                            self._last_step_metrics['cd_spike_gain_max'] = float(gain[is_spike].max().detach().cpu())
+                            self._last_step_metrics['cd_spike_seg_id_mean'] = float(j[is_spike].float().mean().detach().cpu())
+                            self._last_step_metrics['cd_spike_weight_mean'] = float(weight.view(-1)[is_spike].mean().detach().cpu())
+                        else:
+                            for _k in ('cd_spike_loss_mean', 'cd_spike_loss_max',
+                                       'cd_spike_pct_terminal', 'cd_spike_pct_boundary', 'cd_spike_pct_general',
+                                       'cd_spike_sigma_t_mean', 'cd_spike_gain_mean', 'cd_spike_gain_max',
+                                       'cd_spike_seg_id_mean', 'cd_spike_weight_mean'):
+                                self._last_step_metrics[_k] = None
+                        self._last_step_metrics['cd_denoise_quality_all'] = float(denoise_err.mean().detach().cpu())
+                        for bname, lo, hi in zip(bucket_names, bucket_lo, bucket_hi):
+                            mask_b = (sigma_flat >= lo) & (sigma_flat < hi)
+                            self._last_step_metrics[f'cd_denoise_q_{bname}'] = float(denoise_err[mask_b].mean().detach().cpu()) if mask_b.any() else None
+                        if general_mask.any():
+                            ddim_ratio_gen = (sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=1e-12)).squeeze()
+                            self._last_step_metrics['cd_ddim_ratio_gen_mean'] = float(ddim_ratio_gen.mean().detach().cpu())
+                            self._last_step_metrics['cd_ddim_ratio_gen_min'] = float(ddim_ratio_gen.min().detach().cpu())
+                            self._last_step_metrics['cd_ddim_frac_self_ref'] = float((ddim_ratio_gen < 0.1).float().mean().detach().cpu())
+                        else:
+                            self._last_step_metrics['cd_ddim_ratio_gen_mean'] = None
+                            self._last_step_metrics['cd_ddim_ratio_gen_min'] = None
+                            self._last_step_metrics['cd_ddim_frac_self_ref'] = None
+                        self._last_step_metrics['cd_frac_terminal'] = float(num_terminal) / max(num_edges, 1)
+                        self._last_step_metrics['cd_frac_boundary'] = float(num_boundary) / max(num_edges, 1)
+                        self._last_step_metrics['cd_frac_general'] = float(num_general) / max(num_edges, 1)
                     else:
-                        self._last_step_metrics['cd_spike_loss_mean'] = None
-                        self._last_step_metrics['cd_spike_loss_max'] = None
-                        self._last_step_metrics['cd_spike_pct_terminal'] = None
-                        self._last_step_metrics['cd_spike_pct_boundary'] = None
-                        self._last_step_metrics['cd_spike_pct_general'] = None
-                        self._last_step_metrics['cd_spike_sigma_t_mean'] = None
-                        self._last_step_metrics['cd_spike_gain_mean'] = None
-                        self._last_step_metrics['cd_spike_gain_max'] = None
-                        self._last_step_metrics['cd_spike_seg_id_mean'] = None
-                        self._last_step_metrics['cd_spike_weight_mean'] = None
-
-                    # DIAGNOSTIC 7: Per-sigma-bucket denoising quality
-                    self._last_step_metrics['cd_denoise_quality_all'] = float(denoise_err.mean().detach().cpu())
-                    for bname, lo, hi in zip(bucket_names, bucket_lo, bucket_hi):
-                        mask_b = (sigma_flat >= lo) & (sigma_flat < hi)
-                        self._last_step_metrics[f'cd_denoise_q_{bname}'] = float(denoise_err[mask_b].mean().detach().cpu()) if mask_b.any() else None
-
-                    # DIAGNOSTIC 8: DDIM ratio for general edges
-                    if general_mask.any():
-                        ddim_ratio_gen = (sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=1e-12)).squeeze()
-                        self._last_step_metrics['cd_ddim_ratio_gen_mean'] = float(ddim_ratio_gen.mean().detach().cpu())
-                        self._last_step_metrics['cd_ddim_ratio_gen_min'] = float(ddim_ratio_gen.min().detach().cpu())
-                        self._last_step_metrics['cd_ddim_frac_self_ref'] = float((ddim_ratio_gen < 0.1).float().mean().detach().cpu())
-                    else:
-                        self._last_step_metrics['cd_ddim_ratio_gen_mean'] = None
-                        self._last_step_metrics['cd_ddim_ratio_gen_min'] = None
-                        self._last_step_metrics['cd_ddim_frac_self_ref'] = None
-
-                    # DIAGNOSTIC 9: Edge type fractions
-                    self._last_step_metrics['cd_frac_terminal'] = float(num_terminal) / max(num_edges, 1)
-                    self._last_step_metrics['cd_frac_boundary'] = float(num_boundary) / max(num_edges, 1)
-                    self._last_step_metrics['cd_frac_general'] = float(num_general) / max(num_edges, 1)
-
-                    # Optional debug logging (EDM_CD_DEBUG_LOG=1): periodic CD diagnostics.
-                    try:
-                        _dbg_run_dir = getattr(self, '_run_dir', None)
-                        if self.debug_log and _dbg_run_dir:
-                            _dbg_path = os.path.join(_dbg_run_dir, 'debug.log')
-                            _dbg_step = getattr(self, '_dbg_step_counter', 0)
-                            self._dbg_step_counter = _dbg_step + 1
-                            # Log every 50 steps to keep the file manageable
-                            if _dbg_step % 50 == 0:
-                                _dbg_payload = {
-                                    'timestamp': int(datetime.now().timestamp() * 1000),
-                                    'location': 'loss_cd.py:_last_step_metrics',
-                                    'message': 'H1/H2/H3 diagnostics',
-                                    'hypothesisId': 'H1_H2_H3',
-                                    'runId': 'initial',
-                                    'data': {k: v for k, v in self._last_step_metrics.items() if v is not None}
-                                }
-                                with open(_dbg_path, 'a') as _dbf:
-                                    _dbf.write(_json_mod.dumps(_dbg_payload) + '\n')
-                    except Exception:
-                        pass
-                    # #endregion
-
+                        self._last_step_metrics = {}
                 except Exception:
-                    # Diagnostics are best-effort only; do not break training if something goes wrong.
                     self._last_step_metrics = getattr(self, '_last_step_metrics', None)
 
         # #region agent log — stats block done + emit timing

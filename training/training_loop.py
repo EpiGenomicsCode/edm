@@ -110,6 +110,7 @@ def training_loop(
         dist.print0(f'[EMA CONFIG]   Rampup active → effective halflife = min({ema_halflife_kimg} kimg, {ema_rampup_ratio}*cur_nimg)')
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
+    loss_fn._collect_step_metrics = False
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     # DDP configuration — tuned for multi-node CD training:
@@ -356,6 +357,10 @@ def training_loop(
         # #endregion
 
         # Accumulate gradients.
+        # FIX H2: tell loss_fn whether to build _last_step_metrics this step.
+        _will_collect = step_metrics_every > 0 and (cur_step % step_metrics_every == 0)
+        if hasattr(loss_fn, '_collect_step_metrics'):
+            loss_fn._collect_step_metrics = _will_collect
         if os.environ.get('CD_DDP_DEBUG'):
             print(f'[RANK {dist.get_rank()}] zero_grad', flush=True)
         optimizer.zero_grad(set_to_none=True)
@@ -369,8 +374,8 @@ def training_loop(
                 images, labels = next(dataset_iterator)
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: batch fetched, moving to device', flush=True)
-                images = images.to(device).to(torch.float32) / 127.5 - 1
-                labels = labels.to(device)
+                images = images.to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
+                labels = labels.to(device, non_blocking=True)
                 # #region agent log — data load done
                 _t_data_total += time.time() - _t_data_s
                 # #endregion
@@ -395,18 +400,33 @@ def training_loop(
                 # #endregion
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: backward done', flush=True)
-                try:
-                    last_loss_scalar = float(loss.mean().detach().cpu().item())
-                except Exception:
-                    pass
+                # #region agent log — H1 sync timing
+                _t_sync_s = time.time()
+                # #endregion
+                # FIX H1: defer loss scalar extraction — only when step metrics
+                # are needed (see below).  Keeps the GPU→CPU sync out of the
+                # critical path so the allreduce can overlap with CPU work.
+                _loss_mean_gpu = loss.mean().detach()
+                # #region agent log — H1 sync done
+                _t_sync_elapsed = time.time() - _t_sync_s
+                # #endregion
 
         # Update weights.
+        collect_step_metrics = step_metrics_every > 0 and (cur_step % step_metrics_every == 0)
+        # #region agent log — H1 deferred loss scalar
+        _t_deferred_sync_s = time.time()
+        # #endregion
+        if collect_step_metrics:
+            try:
+                last_loss_scalar = float(_loss_mean_gpu.cpu().item())
+            except Exception:
+                pass
+        # #region agent log — H1 deferred sync done
+        _t_deferred_sync_elapsed = time.time() - _t_deferred_sync_s
+        # #endregion
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
-        # Capture the effective LR for this step (assume a single scalar LR across params).
         current_lr = optimizer.param_groups[0]['lr']
-
-        collect_step_metrics = step_metrics_every > 0 and (cur_step % step_metrics_every == 0)
         grad_global_norm = None
         param_global_norm = None
         true_update_over_param = None
@@ -588,7 +608,7 @@ def training_loop(
                 'location': 'training_loop.py:inner_loop',
                 'message': 'step_timing',
                 'hypothesisId': 'H_ALL',
-                'runId': 'post-fix',
+                'runId': 'h1-fix',
                 'data': {
                     'step': cur_step - 1,
                     'rank': 0,
@@ -597,10 +617,13 @@ def training_loop(
                     'data_load_s': round(_t_data_total, 4),
                     'loss_fwd_s': round(_t_loss_total, 4),
                     'backward_s': round(_t_backward_total, 4),
+                    'sync_detach_s': round(_t_sync_elapsed, 4),
+                    'deferred_sync_s': round(_t_deferred_sync_elapsed, 4),
                     'grad_norm_s': round(_t_grad_elapsed, 4),
                     'optimizer_s': round(_t_opt_elapsed, 4),
                     'ema_s': round(_t_ema_elapsed, 4),
                     'accum_rounds': num_accumulation_rounds,
+                    'collect_step_metrics': collect_step_metrics,
                 },
             })
         # #endregion
