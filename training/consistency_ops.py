@@ -1,22 +1,7 @@
 import math
-import os
-import time as _time_mod
-import json as _json_mod
 from typing import Callable, Dict
 
 import torch
-
-# #region agent log — timing helper for consistency_ops
-_COP_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.cursor', 'debug.log')
-_COP_CALL_COUNT = [0]
-def _cop_log(loc, msg, data, hyp='H2'):
-    try:
-        payload = {'timestamp': int(_time_mod.time()*1000), 'location': loc, 'message': msg, 'hypothesisId': hyp, 'runId': 'perf', 'data': data}
-        with open(_COP_LOG_PATH, 'a') as f:
-            f.write(_json_mod.dumps(payload) + '\n')
-    except Exception:
-        pass
-# #endregion
 
 
 @torch.no_grad()
@@ -104,9 +89,6 @@ def filter_teacher_edges_by_sigma(
         teacher_sigmas_cd: 1D tensor of length T_cd+1, descending, last entry 0
         terminal_k_cd: index of the terminal teacher edge (last positive -> 0) in this CD grid
     """
-    # #region agent log — time filter_teacher_edges_by_sigma (H2)
-    _t_filter_start = _time_mod.time()
-    # #endregion
     assert student_sigmas.ndim == 1 and teacher_sigmas.ndim == 1
     T = len(teacher_sigmas) - 1
     assert T >= 1
@@ -154,19 +136,6 @@ def filter_teacher_edges_by_sigma(
     # In this compact grid, terminal edge is the last positive -> 0 transition
     # That's the second-to-last index (index T_cd - 1 where T_cd = len(kept))
     terminal_k_cd = len(kept) - 1  # last kept index position, pointing to last positive before zero
-
-    # #region agent log — filter done; log every 50 calls
-    _t_filter_elapsed = _time_mod.time() - _t_filter_start
-    _COP_CALL_COUNT[0] += 1
-    if _COP_CALL_COUNT[0] % 50 == 0:
-        _cop_log('consistency_ops.py:filter_teacher_edges', 'filter_timing', {
-            'call': _COP_CALL_COUNT[0],
-            'T_input': T,
-            'T_output': len(kept),
-            'student_interior_len': int(student_interior.shape[0]),
-            'elapsed_s': round(_t_filter_elapsed, 6),
-        })
-    # #endregion
 
     return teacher_sigmas_cd, int(terminal_k_cd)
 
@@ -651,5 +620,4 @@ def heun_hop_edm_stochastic(
     Now just calls deterministic heun_hop_edm (churn removed).
     """
     return heun_hop_edm(net, x_t, sigma_t, sigma_s, class_labels, augment_labels)
-
 

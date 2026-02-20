@@ -21,16 +21,12 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
 
-# #region agent log — timing helpers for CPU/GPU bottleneck investigation
-_DBG_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.cursor', 'debug.log')
-_DBG_STEP = [0]
-def _dbg_log(loc, msg, data, hyp='H_ALL'):
+# #region agent log — debug timing config for training loop
+_DBG_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.cursor', 'debug.log')
+def _dbg_log(payload):
     try:
-        import json as _j
-        payload = {'timestamp': int(time.time()*1000), 'location': loc, 'message': msg, 'hypothesisId': hyp, 'runId': 'perf', 'data': data}
-        os.makedirs(os.path.dirname(_DBG_LOG_PATH), exist_ok=True)
-        with open(_DBG_LOG_PATH, 'a') as f:
-            f.write(_j.dumps(payload) + '\n')
+        with open(_DBG_LOG_PATH, 'a') as _f:
+            _f.write(json.dumps(payload) + '\n')
     except Exception:
         pass
 # #endregion
@@ -64,6 +60,7 @@ def training_loop(
     resume_pkl          = None,     # Start from the given network snapshot, None = random initialization.
     resume_state_dump   = None,     # Start from the given training state, None = reset training state.
     resume_kimg         = 0,        # Start from the given training progress.
+    step_metrics_every  = 0,        # Emit per-step JSONL/W&B metrics every N steps (0 = disable).
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
     validation_kwargs   = None,     # Validation configuration (PRD-04).
@@ -115,34 +112,26 @@ def training_loop(
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    # DDP configuration:
-    # - Disable broadcast_buffers since we only use GroupNorm (no running stats).
-    # - Disable gradient_as_bucket_view to avoid rare reducer bucket bugs
-    #   observed with this PyTorch/NCCL combination (negative-dimension tensors
-    #   when rebuilding buckets).
-    # - Keep static_graph=False because enabling it with this CD graph +
-    #   PyTorch build has been observed to trigger internal
-    #   expect_autograd_hooks_ assertions in the reducer.
-    # - Enable find_unused_parameters=True as a conservative setting so that
-    #   the reducer tolerates any parameters that might not participate in the
-    #   backward graph on a given iteration (even though we expect the graph to
-    #   be effectively fixed in practice).
-    #
-    # NOTE: You can override this for performance once you've verified there
-    # are no unused parameters:
-    #   export EDM_DDP_FIND_UNUSED_PARAMETERS=0
+    # DDP configuration — tuned for multi-node CD training:
+    # - broadcast_buffers=False: only GroupNorm (no running stats)
+    # - gradient_as_bucket_view=True: avoids extra gradient copies during allreduce
+    # - find_unused_parameters=False: all params used every iteration
+    # - bucket_cap_mb=100: larger buckets → fewer allreduce calls over cross-node fabric
     _find_unused_env = os.environ.get('EDM_DDP_FIND_UNUSED_PARAMETERS', '').strip().lower()
-    ddp_find_unused_parameters = True
+    ddp_find_unused_parameters = False
     if _find_unused_env != '':
         ddp_find_unused_parameters = _find_unused_env not in ('0', 'false', 'no', 'off')
-    dist.print0(f'[DDP CONFIG] find_unused_parameters={ddp_find_unused_parameters} (EDM_DDP_FIND_UNUSED_PARAMETERS={_find_unused_env or "<unset>"})')
+    _bucket_cap_mb = int(os.environ.get('EDM_DDP_BUCKET_CAP_MB', '100'))
+    dist.print0(f'[DDP CONFIG] find_unused_parameters={ddp_find_unused_parameters} '
+                f'gradient_as_bucket_view=True bucket_cap_mb={_bucket_cap_mb}')
     ddp = torch.nn.parallel.DistributedDataParallel(
         net,
         device_ids=[device],
         broadcast_buffers=False,
-        gradient_as_bucket_view=False,
+        gradient_as_bucket_view=True,
         static_graph=False,
         find_unused_parameters=ddp_find_unused_parameters,
+        bucket_cap_mb=_bucket_cap_mb,
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
@@ -349,6 +338,7 @@ def training_loop(
     cur_step = 0
     ema_updates = 0
     last_loss_scalar = None
+    step_metrics_every = max(int(step_metrics_every or 0), 0)
     while True:
         if os.environ.get('CD_DDP_DEBUG'):
             print(f'[RANK {dist.get_rank()}] loop iter start: cur_nimg={cur_nimg}', flush=True)
@@ -360,20 +350,21 @@ def training_loop(
         except Exception:
             pass
 
+        # #region agent log — step timing
+        _t_step_start = time.time()
+        _t_data_total = 0.0; _t_loss_total = 0.0; _t_backward_total = 0.0
+        # #endregion
+
         # Accumulate gradients.
         if os.environ.get('CD_DDP_DEBUG'):
             print(f'[RANK {dist.get_rank()}] zero_grad', flush=True)
         optimizer.zero_grad(set_to_none=True)
-        # #region agent log — per-step timing instrumentation (H1-H5)
-        _t_step_start = time.time()
-        _t_data_total = 0; _t_loss_total = 0; _t_backward_total = 0
-        # #endregion
         for round_idx in range(num_accumulation_rounds):
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] round {round_idx}: fetching batch', flush=True)
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                # #region agent log — time data loading (H3)
-                _t0 = time.time()
+                # #region agent log — data load timing
+                _t_data_s = time.time()
                 # #endregion
                 images, labels = next(dataset_iterator)
                 if os.environ.get('CD_DDP_DEBUG'):
@@ -381,28 +372,26 @@ def training_loop(
                 images = images.to(device).to(torch.float32) / 127.5 - 1
                 labels = labels.to(device)
                 # #region agent log — data load done
-                _t_data_total += time.time() - _t0
+                _t_data_total += time.time() - _t_data_s
                 # #endregion
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: calling loss_fn', flush=True)
-                # #region agent log — time loss forward (H1, H2)
-                _t0 = time.time()
+                # #region agent log — loss fwd timing
+                _t_loss_s = time.time()
                 # #endregion
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
-                # #region agent log — loss forward done
-                torch.cuda.synchronize(device)
-                _t_loss_total += time.time() - _t0
+                # #region agent log — loss fwd done
+                _t_loss_total += time.time() - _t_loss_s
                 # #endregion
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: loss computed, calling backward', flush=True)
                 training_stats.report('Loss/loss', loss)
-                # #region agent log — time backward (H5)
-                _t0 = time.time()
+                # #region agent log — backward timing
+                _t_bwd_s = time.time()
                 # #endregion
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
                 # #region agent log — backward done
-                torch.cuda.synchronize(device)
-                _t_backward_total += time.time() - _t0
+                _t_backward_total += time.time() - _t_bwd_s
                 # #endregion
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: backward done', flush=True)
@@ -417,43 +406,44 @@ def training_loop(
         # Capture the effective LR for this step (assume a single scalar LR across params).
         current_lr = optimizer.param_groups[0]['lr']
 
-        # #region agent log — time grad norm computation (H4)
-        _t_grad_start = time.time()
+        collect_step_metrics = step_metrics_every > 0 and (cur_step % step_metrics_every == 0)
+        grad_global_norm = None
+        param_global_norm = None
+        true_update_over_param = None
+        # #region agent log — grad norm timing
+        _t_grad_s = time.time()
         # #endregion
-        # Sanitize gradients and compute global norms (per optimizer step).
-        total_grad_sq = torch.zeros([], device=device)
-        total_param_sq = torch.zeros([], device=device)
-        for param in net.parameters():
-            # Accumulate parameter norm regardless of gradient presence.
-            param_norm = param.detach().float().norm(2)
-            total_param_sq = total_param_sq + param_norm * param_norm
-            if param.grad is not None:
-                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-                grad_norm = param.grad.detach().float().norm(2)
-                total_grad_sq = total_grad_sq + grad_norm * grad_norm
-        grad_global_norm = torch.sqrt(total_grad_sq)
-        param_global_norm = torch.sqrt(total_param_sq)
-        # True update/param ratio, incorporating the current learning rate.
-        true_update_over_param = (current_lr * grad_global_norm) / torch.clamp(param_global_norm, min=1e-12)
-        training_stats.report('Grad/global_norm', grad_global_norm)
-        training_stats.report('Grad/param_norm', param_global_norm)
-        training_stats.report('Grad/update_over_param', true_update_over_param)
-        # #region agent log — grad norm done
-        torch.cuda.synchronize(device)
-        _t_grad_elapsed = time.time() - _t_grad_start
-        # #endregion
-        # #region agent log — time optimizer step
-        _t_opt_start = time.time()
+        # Sanitize gradients always; only compute expensive global norms when step metrics are enabled.
+        if collect_step_metrics:
+            total_grad_sq = torch.zeros([], device=device)
+            total_param_sq = torch.zeros([], device=device)
+            for param in net.parameters():
+                param_norm = param.detach().float().norm(2)
+                total_param_sq = total_param_sq + param_norm * param_norm
+                if param.grad is not None:
+                    torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+                    grad_norm = param.grad.detach().float().norm(2)
+                    total_grad_sq = total_grad_sq + grad_norm * grad_norm
+            grad_global_norm = torch.sqrt(total_grad_sq)
+            param_global_norm = torch.sqrt(total_param_sq)
+            true_update_over_param = (current_lr * grad_global_norm) / torch.clamp(param_global_norm, min=1e-12)
+            training_stats.report('Grad/global_norm', grad_global_norm)
+            training_stats.report('Grad/param_norm', param_global_norm)
+            training_stats.report('Grad/update_over_param', true_update_over_param)
+        else:
+            for param in net.parameters():
+                if param.grad is not None:
+                    torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+        # #region agent log — grad norm done, optimizer step timing
+        _t_grad_elapsed = time.time() - _t_grad_s
+        _t_opt_s = time.time()
         # #endregion
         optimizer.step()
         # #region agent log — optimizer step done
-        _t_opt_elapsed = time.time() - _t_opt_start
-        # #endregion
-        # #region agent log — time per-step logging (H3)
-        _t_log_start = time.time()
+        _t_opt_elapsed = time.time() - _t_opt_s
         # #endregion
         # Per-optimizer-step diagnostics (rank 0 only, written to step_stats.jsonl and W&B).
-        if dist.get_rank() == 0:
+        if collect_step_metrics and dist.get_rank() == 0:
             if step_stats_jsonl is None and run_dir is not None:
                 step_stats_path = os.path.join(run_dir, 'step_stats.jsonl')
                 step_stats_jsonl = open(step_stats_path, 'at')
@@ -470,9 +460,9 @@ def training_loop(
                 'tick': int(cur_tick),
                 'ema_beta': float(_ema_beta_log),
                 'lr': float(current_lr),
-                'grad_global_norm': float(grad_global_norm.detach().cpu()),
-                'param_global_norm': float(param_global_norm.detach().cpu()),
-                'update_over_param': float(true_update_over_param.detach().cpu()),
+                'grad_global_norm': float(grad_global_norm.detach().cpu()) if grad_global_norm is not None else None,
+                'param_global_norm': float(param_global_norm.detach().cpu()) if param_global_norm is not None else None,
+                'update_over_param': float(true_update_over_param.detach().cpu()) if true_update_over_param is not None else None,
                 'loss': float(last_loss_scalar) if last_loss_scalar is not None else None,
             }
             if hasattr(loss_fn, '_last_step_metrics') and isinstance(getattr(loss_fn, '_last_step_metrics'), dict):
@@ -488,11 +478,14 @@ def training_loop(
                     wandb_payload = {
                         'opt_step': step_record['step'],
                         'kimg': step_record['kimg'],
-                        'Grad/global_norm': step_record['grad_global_norm'],
-                        'Grad/param_norm': step_record['param_global_norm'],
-                        'Grad/update_over_param': step_record['update_over_param'],
                         'EMA/val_ema_beta': step_record['ema_beta'],
                     }
+                    if step_record['grad_global_norm'] is not None:
+                        wandb_payload['Grad/global_norm'] = step_record['grad_global_norm']
+                    if step_record['param_global_norm'] is not None:
+                        wandb_payload['Grad/param_norm'] = step_record['param_global_norm']
+                    if step_record['update_over_param'] is not None:
+                        wandb_payload['Grad/update_over_param'] = step_record['update_over_param']
                     # Per-step loss (separate from tick-level summary loss).
                     if step_record['loss'] is not None:
                         wandb_payload['Loss/loss_step'] = step_record['loss']
@@ -563,12 +556,8 @@ def training_loop(
                 except Exception as _e:
                     dist.print0(f'[W&B] per-step log failed: {_e}')
         cur_step += 1
-        # #region agent log — per-step logging done
-        _t_log_elapsed = time.time() - _t_log_start
-        # #endregion
-
-        # #region agent log — time EMA update
-        _t_ema_start = time.time()
+        # #region agent log — EMA timing
+        _t_ema_s = time.time()
         # #endregion
         # Update EMA (validation/snapshot EMA).
         ema_halflife_nimg = ema_halflife_kimg * 1000
@@ -578,25 +567,6 @@ def training_loop(
         for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
         ema_updates += 1
-        # #region agent log — EMA done
-        _t_ema_elapsed = time.time() - _t_ema_start
-        _t_step_total = time.time() - _t_step_start
-        # Log timing every 5 steps, only on rank 0
-        _DBG_STEP[0] += 1
-        if _DBG_STEP[0] % 5 == 0 and dist.get_rank() == 0:
-            _dbg_log('training_loop.py:inner_loop', 'step_timing', {
-                'step': _DBG_STEP[0], 'rank': dist.get_rank(), 'world_size': dist.get_world_size(),
-                'total_s': round(_t_step_total, 4),
-                'data_load_s': round(_t_data_total, 4),
-                'loss_fwd_s': round(_t_loss_total, 4),
-                'backward_s': round(_t_backward_total, 4),
-                'grad_norm_s': round(_t_grad_elapsed, 4),
-                'optimizer_s': round(_t_opt_elapsed, 4),
-                'logging_s': round(_t_log_elapsed, 4),
-                'ema_s': round(_t_ema_elapsed, 4),
-                'accum_rounds': num_accumulation_rounds,
-            }, hyp='H_ALL')
-        # #endregion
         
         # Update target EMA (for CD sigma_s denoiser, OpenAI CM style).
         # This uses a fixed EMA rate (no rampup), matching OpenAI's "fixed" mode.
@@ -609,6 +579,31 @@ def training_loop(
             # to ensure the loss function has the correct reference after resume/reload.)
             if hasattr(loss_fn, 'set_target_net'):
                 loss_fn.set_target_net(target_ema_net)
+        # #region agent log — EMA done, emit step timing
+        _t_ema_elapsed = time.time() - _t_ema_s
+        _t_step_total = time.time() - _t_step_start
+        if (cur_step - 1) % 5 == 0 and dist.get_rank() == 0:
+            _dbg_log({
+                'timestamp': int(time.time() * 1000),
+                'location': 'training_loop.py:inner_loop',
+                'message': 'step_timing',
+                'hypothesisId': 'H_ALL',
+                'runId': 'post-fix',
+                'data': {
+                    'step': cur_step - 1,
+                    'rank': 0,
+                    'world_size': dist.get_world_size(),
+                    'total_s': round(_t_step_total, 4),
+                    'data_load_s': round(_t_data_total, 4),
+                    'loss_fwd_s': round(_t_loss_total, 4),
+                    'backward_s': round(_t_backward_total, 4),
+                    'grad_norm_s': round(_t_grad_elapsed, 4),
+                    'optimizer_s': round(_t_opt_elapsed, 4),
+                    'ema_s': round(_t_ema_elapsed, 4),
+                    'accum_rounds': num_accumulation_rounds,
+                },
+            })
+        # #endregion
 
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
