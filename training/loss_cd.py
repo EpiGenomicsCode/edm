@@ -1,9 +1,7 @@
 import math
 import os
 import copy
-import json as _json_mod
 from typing import Optional, Tuple, Dict, List, Any
-from datetime import datetime
 
 import torch
 from torch_utils import persistence
@@ -11,7 +9,6 @@ from torch_utils import training_stats
 
 from .consistency_ops import (
     make_karras_sigmas,
-    partition_edges_into_segments,
     partition_edges_by_sigma,
     filter_teacher_edges_by_sigma,
     sample_segment_and_teacher_pair,
@@ -120,7 +117,6 @@ class EDMConsistencyDistillLoss:
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
         target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA or teacher)
-        anchor_by_sigma: bool = True,   # If True, segment teacher edges in sigma-space (closest-to-boundary first)
         sampling_mode: str = "vp",  # Edge sampling: "uniform" | "vp" (MSCD uniform-t) | "edm" (log-normal)
         terminal_anchor: bool = True,  # Anchor terminal edge to 1/T probability (matches MSCD paper)
         terminal_teacher_hop: bool = False,  # Use teacher Euler hop for terminal edge instead of clean image y
@@ -163,7 +159,6 @@ class EDMConsistencyDistillLoss:
         # - EMA copy of student: stabilizes training (OpenAI's approach, rate=0.95)
         # - Frozen teacher: for debugging
         self.target_net = target_net
-        self.anchor_by_sigma = bool(anchor_by_sigma)
         assert sampling_mode in ("uniform", "vp", "edm"), f"Invalid sampling_mode: {sampling_mode}"
         self.sampling_mode = sampling_mode
         self.terminal_anchor = bool(terminal_anchor)
@@ -179,6 +174,7 @@ class EDMConsistencyDistillLoss:
         self._count_general_edges = 0       # total general interior edges sampled (per-sample)
         self._count_total_calls = 0         # total __call__ invocations (unchanged semantics)
         self._count_total_edges = 0         # NEW: total sampled edges across all calls (≈ batch_size × calls)
+        self._filter_cache = {}             # {T_edges_int: (teacher_sigmas, terminal_k)}
 
     def set_run_dir(self, run_dir: str) -> None:
         """Set the training run directory for debug logging."""
@@ -360,64 +356,30 @@ class EDMConsistencyDistillLoss:
         # Full teacher grid from Karras schedule
         teacher_sigmas_full = self._build_teacher_grid(device=device)      # [T+1] with terminal 0
 
-        if self.anchor_by_sigma:
-            # Build CD-specific teacher grid with duplicates removed
+        T_edges_int = self._current_T_edges()
+        if T_edges_int in self._filter_cache:
+            teacher_sigmas, terminal_k = self._filter_cache[T_edges_int]
+            teacher_sigmas = teacher_sigmas.to(device)
+        else:
             teacher_sigmas, terminal_k = filter_teacher_edges_by_sigma(
                 student_sigmas=student_sigmas,
                 teacher_sigmas=teacher_sigmas_full,
             )
-        else:
-            teacher_sigmas = teacher_sigmas_full
-            terminal_k = teacher_sigmas.shape[0] - 2  # last positive before terminal 0
+            self._filter_cache[T_edges_int] = (teacher_sigmas.clone(), terminal_k)
 
-        # Now everything below uses the (maybe filtered) teacher_sigmas
-        T_edges = teacher_sigmas.shape[0] - 1  # number of edges in CD grid
+        T_edges = teacher_sigmas.shape[0] - 1
 
-        # #region agent log — H1: log T_edges and sigma grid (every 200 forward calls)
-        _fwd_cnt = getattr(self, '_dbg_fwd_counter', 0)
-        self._dbg_fwd_counter = _fwd_cnt + 1
-        if _fwd_cnt % 200 == 0 and getattr(self, '_run_dir', None):
-            try:
-                _dbg_path = os.path.join(self._run_dir, 'debug.log')
-                _h1_payload = {
-                    'timestamp': int(datetime.now().timestamp() * 1000),
-                    'location': 'loss_cd.py:__call__:grid_setup',
-                    'message': 'H1 teacher grid snapshot',
-                    'hypothesisId': 'H1',
-                    'runId': 'initial',
-                    'data': {
-                        'T_edges': int(T_edges),
-                        'sigma_max': float(teacher_sigmas[0].cpu()),
-                        'sigma_min_pos': float(teacher_sigmas[-2].cpu()) if teacher_sigmas.shape[0] > 1 else None,
-                        'student_S': self.S,
-                        'fwd_call': _fwd_cnt,
-                    }
-                }
-                with open(_dbg_path, 'a') as _dbf:
-                    _dbf.write(_json_mod.dumps(_h1_payload) + '\n')
-            except Exception:
-                pass
-        # #endregion
+        sigma_bounds = partition_edges_by_sigma(
+            student_sigmas=student_sigmas,
+            teacher_sigmas=teacher_sigmas,
+        )
 
-        # Index-based segment boundaries (for index-anchored path)
-        boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
-
-        sigma_bounds = None
-        if self.anchor_by_sigma:
-            sigma_bounds = partition_edges_by_sigma(
-                student_sigmas=student_sigmas,
-                teacher_sigmas=teacher_sigmas,  # already filtered & strictly descending
-            )
-
-        # Sample per-sample edges: each element in batch gets independent (j, k_t, k_s, sigmas).
         sample_dict = sample_segment_and_teacher_pair(
-            boundaries=boundaries,
+            sigma_bounds=sigma_bounds,
             teacher_sigmas=teacher_sigmas,
             student_sigmas=student_sigmas,
-            batch_size=batch_size,         # per-sample sampling (PRD §4.2.1)
+            batch_size=batch_size,
             device=device,
-            anchor_by_sigma=self.anchor_by_sigma,
-            sigma_bounds=sigma_bounds,
             terminal_k=terminal_k,
             sampling_mode=self.sampling_mode,
             rho=self.rho,
@@ -592,44 +554,7 @@ class EDMConsistencyDistillLoss:
                 )
             raise ValueError(error_msg) from e
 
-        # #region agent log — H2/H3: invDDIM target stats (every 200 fwd calls)
-        if _fwd_cnt % 200 == 0 and getattr(self, '_run_dir', None):
-            try:
-                _dbg_path = os.path.join(self._run_dir, 'debug.log')
-                _target_norm = float(torch.sqrt((x_hat_t_star ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _ref_norm = float(torch.sqrt((x_ref_bdry ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _y_norm = float(torch.sqrt((y ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _target_y_err = float(torch.sqrt(((x_hat_t_star - y) ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _h23_payload = {
-                    'timestamp': int(datetime.now().timestamp() * 1000),
-                    'location': 'loss_cd.py:__call__:invDDIM_target',
-                    'message': 'H2/H3 invDDIM target quality',
-                    'hypothesisId': 'H2_H3',
-                    'runId': 'initial',
-                    'data': {
-                        'target_norm_mean': _target_norm,
-                        'ref_bdry_norm_mean': _ref_norm,
-                        'clean_image_norm_mean': _y_norm,
-                        'target_vs_clean_err': _target_y_err,
-                        'gain_mean': float(gain.mean().detach().cpu()),
-                        'gain_max': float(gain.max().detach().cpu()),
-                        'ratio_ref_mean': float(ratio_ref.mean().detach().cpu()),
-                        'ratio_ref_max': float(ratio_ref.max().detach().cpu()),
-                        'sigma_ref_mean': float(sigma_ref_vec.mean().detach().cpu()),
-                        'sigma_t_mean': float(sigma_t_vec.mean().detach().cpu()),
-                        'fwd_call': _fwd_cnt,
-                        'num_terminal': int(is_terminal.sum().item()),
-                        'num_boundary': int(is_boundary_snap.sum().item()),
-                        'num_general': int(is_general.sum().item()),
-                    }
-                }
-                with open(_dbg_path, 'a') as _dbf:
-                    _dbf.write(_json_mod.dumps(_h23_payload) + '\n')
-            except Exception:
-                pass
-        # #endregion
-
-        # Student prediction at t (PRD §4.2.7)
+        # Student prediction at t
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
 
         # Weighting and loss
@@ -1081,30 +1006,6 @@ class EDMConsistencyDistillLoss:
                     self._last_step_metrics['cd_frac_terminal'] = float(num_terminal) / max(num_edges, 1)
                     self._last_step_metrics['cd_frac_boundary'] = float(num_boundary) / max(num_edges, 1)
                     self._last_step_metrics['cd_frac_general'] = float(num_general) / max(num_edges, 1)
-
-                    # #region agent log — debug instrumentation for H1/H2/H3 hypotheses
-                    try:
-                        _dbg_run_dir = getattr(self, '_run_dir', None)
-                        if _dbg_run_dir:
-                            _dbg_path = os.path.join(_dbg_run_dir, 'debug.log')
-                            _dbg_step = getattr(self, '_dbg_step_counter', 0)
-                            self._dbg_step_counter = _dbg_step + 1
-                            # Log every 50 steps to keep the file manageable
-                            if _dbg_step % 50 == 0:
-                                _dbg_payload = {
-                                    'timestamp': int(datetime.now().timestamp() * 1000),
-                                    'location': 'loss_cd.py:_last_step_metrics',
-                                    'message': 'H1/H2/H3 diagnostics',
-                                    'hypothesisId': 'H1_H2_H3',
-                                    'runId': 'initial',
-                                    'data': {k: v for k, v in self._last_step_metrics.items() if v is not None}
-                                }
-                                with open(_dbg_path, 'a') as _dbf:
-                                    _dbf.write(_json_mod.dumps(_dbg_payload) + '\n')
-                    except Exception:
-                        pass
-                    # #endregion
-
                 except Exception:
                     # Diagnostics are best-effort only; do not break training if something goes wrong.
                     self._last_step_metrics = getattr(self, '_last_step_metrics', None)
