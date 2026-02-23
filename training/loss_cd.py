@@ -514,12 +514,63 @@ class EDMConsistencyDistillLoss:
                     ).to(torch.float32)
                 else:
                     # Standard path: use live STUDENT at σ_s.
+                    # Disable dropout/label_dropout for the target reference so the
+                    # inv-DDIM target is deterministic (matches ema/teacher modes
+                    # which are already .eval()).  Only GroupNorm is used (no running
+                    # stats), so eval/train toggle is safe.
+                    _fwd_ab = getattr(self, '_dbg_fwd_ab', 0)
+                    self._dbg_fwd_ab = _fwd_ab + 1
+                    _do_ab = (_fwd_ab % 100 == 0)
+
+                    # #region agent log — A/B: measure dropout impact on target
+                    _x_hat_train = None
+                    if _do_ab:
+                        x_hat_s_ng_train = net(
+                            x_s_teach[idx_g], sigma_s[idx_g],
+                            labels[idx_g] if labels is not None else None,
+                            augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                        ).to(torch.float32)
+                        _x_hat_train = x_hat_s_ng_train
+                    # #endregion
+
+                    net.eval()
                     x_hat_s_ng = net(
                         x_s_teach[idx_g],
                         sigma_s[idx_g],              # [N_g,1,1,1]
                         labels[idx_g] if labels is not None else None,
                         augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
                     ).to(torch.float32)
+                    net.train()
+
+                    # #region agent log — A/B: log train-vs-eval difference
+                    if _do_ab and _x_hat_train is not None:
+                        try:
+                            import json as _jab
+                            _ab_diff = (_x_hat_train - x_hat_s_ng).float()
+                            _eval_out = x_hat_s_ng.float()
+                            _per_sample_l2 = torch.sqrt((_ab_diff ** 2).sum(dim=[1,2,3]).clamp(min=1e-12))
+                            _per_sample_eval_norm = torch.sqrt((_eval_out ** 2).sum(dim=[1,2,3]).clamp(min=1e-12))
+                            _rel_diff = _per_sample_l2 / _per_sample_eval_norm.clamp(min=1e-12)
+                            _pl = {'sessionId':'6b70d4','hypothesisId':'dropout_AB',
+                                   'location':'loss_cd.py:target_AB','message':'train-vs-eval target diff',
+                                   'timestamp':int(__import__('time').time()*1000),
+                                   'data':{
+                                       'fwd': _fwd_ab,
+                                       'n_general': int(idx_g.sum().item()),
+                                       'abs_diff_mean': float(_per_sample_l2.mean().cpu()),
+                                       'abs_diff_max': float(_per_sample_l2.max().cpu()),
+                                       'rel_diff_mean': float(_rel_diff.mean().cpu()),
+                                       'rel_diff_max': float(_rel_diff.max().cpu()),
+                                       'eval_norm_mean': float(_per_sample_eval_norm.mean().cpu()),
+                                       'train_norm_mean': float(torch.sqrt((_x_hat_train**2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().cpu()),
+                                       'dropout_p': 0.13,
+                                   }}
+                            _dbg_log_path = os.path.join(self._run_dir, 'debug-6b70d4.log') if getattr(self, '_run_dir', None) else os.path.join(os.getcwd(), 'debug-6b70d4.log')
+                            with open(_dbg_log_path, 'a') as _fab:
+                                _fab.write(_jab.dumps(_pl)+'\n')
+                        except Exception:
+                            pass
+                    # #endregion
             
             ratio_s_b = (sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)).to(torch.float32)
             x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
@@ -554,46 +605,8 @@ class EDMConsistencyDistillLoss:
                 )
             raise ValueError(error_msg) from e
 
-        # #region agent log — H1/H2: dropout & edge-type diagnostics
-        _dbg_log_path = '/Users/vinay/edm/.cursor/debug-6b70d4.log'
-        _dbg_fwd_cnt2 = getattr(self, '_dbg_fwd_counter2', 0)
-        self._dbg_fwd_counter2 = _dbg_fwd_cnt2 + 1
-        if _dbg_fwd_cnt2 % 50 == 0:
-            try:
-                import json as _j2
-                _n_gen = int(general_mask.sum().item())
-                _n_term = int(is_terminal.sum().item())
-                _n_bdry = int(boundary_mask.sum().item())
-                _target_norm = float(torch.sqrt((x_hat_t_star ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu()) if x_hat_t_star is not None else -1
-                _payload = {'sessionId':'6b70d4','hypothesisId':'H1_H2','location':'loss_cd.py:pre_student_fwd','message':'edge-type & target stats',
-                    'timestamp': int(__import__('time').time()*1000),
-                    'data':{'fwd':_dbg_fwd_cnt2,'n_general':_n_gen,'n_terminal':_n_term,'n_boundary':_n_bdry,'batch_size':batch_size,
-                            'general_frac':_n_gen/max(batch_size,1),'target_norm':_target_norm,
-                            'cd_target_mode':'live' if self.target_net is None else 'ema_or_teacher',
-                            'net_training': bool(net.training) if hasattr(net,'training') else 'unknown'}}
-                with open(_dbg_log_path, 'a') as _f2:
-                    _f2.write(_j2.dumps(_payload) + '\n')
-            except Exception:
-                pass
-        # #endregion
-
-        # Student prediction at t
+        # Student prediction at t (net is back in .train() mode → dropout active)
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
-
-        # #region agent log — H1: dropout impact on student output
-        if _dbg_fwd_cnt2 % 50 == 0:
-            try:
-                import json as _j3
-                _student_norm = float(torch.sqrt((x_hat_t ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _diff_norm = float(torch.sqrt(((x_hat_t - x_hat_t_star) ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _payload2 = {'sessionId':'6b70d4','hypothesisId':'H1','location':'loss_cd.py:post_student_fwd','message':'student vs target diff',
-                    'timestamp': int(__import__('time').time()*1000),
-                    'data':{'fwd':_dbg_fwd_cnt2,'student_norm':_student_norm,'target_norm':_target_norm,'diff_norm':_diff_norm}}
-                with open(_dbg_log_path, 'a') as _f3:
-                    _f3.write(_j3.dumps(_payload2) + '\n')
-            except Exception:
-                pass
-        # #endregion
 
         # Weighting and loss
         # _weight expects 1D sigma vector [N]

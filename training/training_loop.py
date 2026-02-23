@@ -388,7 +388,8 @@ def training_loop(
                        'message':'grad norm after backward','timestamp':int(__import__('time').time()*1000),
                        'data':{'step':_dbg_step_cnt,'grad_norm':_grad_norm,'n_grads':_n_grads,'none_grads':_none_grads,
                                'n_params':_n_params,'loss':last_loss_scalar,'acc_rounds':num_accumulation_rounds}}
-                with open('/Users/vinay/edm/.cursor/debug-6b70d4.log','a') as _fl:
+                _dbg_log_path = os.path.join(run_dir, 'debug-6b70d4.log') if run_dir else os.path.join(os.getcwd(), 'debug-6b70d4.log')
+                with open(_dbg_log_path, 'a') as _fl:
                     _fl.write(_jloop.dumps(_pl)+'\n')
             except Exception:
                 pass
