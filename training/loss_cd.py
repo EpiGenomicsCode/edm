@@ -514,12 +514,18 @@ class EDMConsistencyDistillLoss:
                     ).to(torch.float32)
                 else:
                     # Standard path: use live STUDENT at σ_s.
+                    # Disable dropout/label_dropout for the target reference so the
+                    # inv-DDIM target is deterministic (matches ema/teacher modes
+                    # which are already .eval()).  Only GroupNorm is used (no running
+                    # stats), so eval/train toggle is safe.
+                    net.eval()
                     x_hat_s_ng = net(
                         x_s_teach[idx_g],
                         sigma_s[idx_g],              # [N_g,1,1,1]
                         labels[idx_g] if labels is not None else None,
                         augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
                     ).to(torch.float32)
+                    net.train()
             
             ratio_s_b = (sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)).to(torch.float32)
             x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
@@ -554,7 +560,7 @@ class EDMConsistencyDistillLoss:
                 )
             raise ValueError(error_msg) from e
 
-        # Student prediction at t
+        # Student prediction at t (net is back in .train() mode → dropout active)
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
 
         # Weighting and loss
