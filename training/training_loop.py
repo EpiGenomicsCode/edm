@@ -373,6 +373,27 @@ def training_loop(
                 except Exception:
                     pass
 
+        # #region agent log — H3: gradient norm after backward (DDP double-forward check)
+        _dbg_step_cnt = getattr(loss_fn, '_dbg_step_counter', 0)
+        loss_fn._dbg_step_counter = _dbg_step_cnt + 1
+        if _dbg_step_cnt % 50 == 0 and dist.get_rank() == 0:
+            try:
+                import json as _jloop
+                _grad_sq = sum(float(p.grad.detach().float().norm(2).item())**2 for p in net.parameters() if p.grad is not None)
+                _grad_norm = _grad_sq ** 0.5
+                _n_grads = sum(1 for p in net.parameters() if p.grad is not None)
+                _n_params = sum(1 for p in net.parameters())
+                _none_grads = _n_params - _n_grads
+                _pl = {'sessionId':'6b70d4','hypothesisId':'H3','location':'training_loop.py:post_backward',
+                       'message':'grad norm after backward','timestamp':int(__import__('time').time()*1000),
+                       'data':{'step':_dbg_step_cnt,'grad_norm':_grad_norm,'n_grads':_n_grads,'none_grads':_none_grads,
+                               'n_params':_n_params,'loss':last_loss_scalar,'acc_rounds':num_accumulation_rounds}}
+                with open('/Users/vinay/edm/.cursor/debug-6b70d4.log','a') as _fl:
+                    _fl.write(_jloop.dumps(_pl)+'\n')
+            except Exception:
+                pass
+        # #endregion
+
         # Update weights.
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)

@@ -554,8 +554,46 @@ class EDMConsistencyDistillLoss:
                 )
             raise ValueError(error_msg) from e
 
+        # #region agent log — H1/H2: dropout & edge-type diagnostics
+        _dbg_log_path = '/Users/vinay/edm/.cursor/debug-6b70d4.log'
+        _dbg_fwd_cnt2 = getattr(self, '_dbg_fwd_counter2', 0)
+        self._dbg_fwd_counter2 = _dbg_fwd_cnt2 + 1
+        if _dbg_fwd_cnt2 % 50 == 0:
+            try:
+                import json as _j2
+                _n_gen = int(general_mask.sum().item())
+                _n_term = int(is_terminal.sum().item())
+                _n_bdry = int(boundary_mask.sum().item())
+                _target_norm = float(torch.sqrt((x_hat_t_star ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu()) if x_hat_t_star is not None else -1
+                _payload = {'sessionId':'6b70d4','hypothesisId':'H1_H2','location':'loss_cd.py:pre_student_fwd','message':'edge-type & target stats',
+                    'timestamp': int(__import__('time').time()*1000),
+                    'data':{'fwd':_dbg_fwd_cnt2,'n_general':_n_gen,'n_terminal':_n_term,'n_boundary':_n_bdry,'batch_size':batch_size,
+                            'general_frac':_n_gen/max(batch_size,1),'target_norm':_target_norm,
+                            'cd_target_mode':'live' if self.target_net is None else 'ema_or_teacher',
+                            'net_training': bool(net.training) if hasattr(net,'training') else 'unknown'}}
+                with open(_dbg_log_path, 'a') as _f2:
+                    _f2.write(_j2.dumps(_payload) + '\n')
+            except Exception:
+                pass
+        # #endregion
+
         # Student prediction at t
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
+
+        # #region agent log — H1: dropout impact on student output
+        if _dbg_fwd_cnt2 % 50 == 0:
+            try:
+                import json as _j3
+                _student_norm = float(torch.sqrt((x_hat_t ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
+                _diff_norm = float(torch.sqrt(((x_hat_t - x_hat_t_star) ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
+                _payload2 = {'sessionId':'6b70d4','hypothesisId':'H1','location':'loss_cd.py:post_student_fwd','message':'student vs target diff',
+                    'timestamp': int(__import__('time').time()*1000),
+                    'data':{'fwd':_dbg_fwd_cnt2,'student_norm':_student_norm,'target_norm':_target_norm,'diff_norm':_diff_norm}}
+                with open(_dbg_log_path, 'a') as _f3:
+                    _f3.write(_j3.dumps(_payload2) + '\n')
+            except Exception:
+                pass
+        # #endregion
 
         # Weighting and loss
         # _weight expects 1D sigma vector [N]
