@@ -414,19 +414,12 @@ class EDMConsistencyDistillLoss:
             sigma_s_eff,
         )
 
-        # Broadcast per-sample sigmas to [N,1,1,1] for BCHW operations (PRD §4.2.3).
-        #   - sigma_t_vec / sigma_s_eff / sigma_bdry_vec come from Karras grids and are float64 by default.
-        #   - y is float32 (images converted to float32 in training_loop).
-        #   - If we leave sigmas as float64, x_t = y + sigma_t * eps becomes float64 and
-        #     x_ref_bdry (zeros_like(x_t)) is also float64, while y[...] is float32.
-        #   - On the NCSA GH200 nodes this caused:
-        #         RuntimeError: Index put requires the source and destination dtypes match,
-        #         got Double for the destination and Float for the source.
-        #   - We fix this by explicitly casting sigmas to y.dtype before broadcasting so that
-        #     x_t and all downstream tensors stay in float32.
-        sigma_t = sigma_t_vec.to(y.dtype).view(batch_size, 1, 1, 1)
-        sigma_s = sigma_s_eff.to(y.dtype).view(batch_size, 1, 1, 1)
-        sigma_bdry = sigma_bdry_vec.to(y.dtype).view(batch_size, 1, 1, 1)
+        # Broadcast per-sample sigmas to [N,1,1,1] for BCHW operations.
+        # All target-path arithmetic (x_t, Heun, DDIM, invDDIM) runs in float64
+        # to avoid cancellation errors.  Sigmas stay in their native float64.
+        sigma_t = sigma_t_vec.to(torch.float64).view(batch_size, 1, 1, 1)
+        sigma_s = sigma_s_eff.to(torch.float64).view(batch_size, 1, 1, 1)
+        sigma_bdry = sigma_bdry_vec.to(torch.float64).view(batch_size, 1, 1, 1)
 
         # Optional runtime invariant checks (PRD §5, R7)
         if self.debug_invariants:
@@ -441,9 +434,10 @@ class EDMConsistencyDistillLoss:
             # Sampler-specific invariants
             assert (n_rel[is_boundary_snap] == 1).all(), "Boundary snap edges must have n_rel == 1"
 
-        # Sample noise and form x_t = y + sigma_t * eps (PRD §4.2.4)
-        eps = torch.randn_like(y)
-        x_t = y + sigma_t * eps
+        # Sample noise and form x_t = y + sigma_t * eps in float64.
+        eps = torch.randn_like(y).to(torch.float64)
+        y64 = y.to(torch.float64)
+        x_t = y64 + sigma_t * eps  # float64
 
         # Mixed terminal/non-terminal teacher hop logic (PRD §4.2.5)
         # Define per-sample masks
@@ -451,10 +445,10 @@ class EDMConsistencyDistillLoss:
         boundary_mask = is_boundary_snap     # [N]
         general_mask = (~is_terminal) & (~is_boundary_snap)  # [N]
         
-        # Allocate containers
-        x_s_teach = torch.zeros_like(x_t)          # [N, C, H, W]
-        x_ref_bdry = torch.zeros_like(x_t)         # [N, C, H, W]
-        sigma_ref_vec = torch.zeros_like(sigma_t_vec)  # [N]
+        # Allocate containers in float64
+        x_s_teach = torch.zeros_like(x_t)          # [N, C, H, W] float64
+        x_ref_bdry = torch.zeros_like(x_t)         # [N, C, H, W] float64
+        sigma_ref_vec = sigma_t_vec.new_zeros(batch_size).to(torch.float64)  # [N]
         tol = 1e-12
         
         # Teacher hop only for non-terminal samples
@@ -480,17 +474,17 @@ class EDMConsistencyDistillLoss:
         if self.terminal_teacher_hop and is_terminal.any():
             with torch.no_grad():
                 x_ref_bdry[is_terminal] = self.teacher_net(
-                    x_t[is_terminal],
+                    x_t[is_terminal].float(),
                     sigma_t_vec[is_terminal],
                     labels[is_terminal] if labels is not None else None,
                     augment_labels=augment_labels[is_terminal] if augment_labels is not None else None,
-                ).to(torch.float32)
+                ).to(torch.float64)
         else:
-            x_ref_bdry[is_terminal] = y[is_terminal].to(torch.float32)
+            x_ref_bdry[is_terminal] = y64[is_terminal]
         sigma_ref_vec[is_terminal] = 0.0
         
         # Boundary snap edges: reference is teacher hop, σ_ref = σ_s_eff
-        x_ref_bdry[boundary_mask] = x_s_teach[boundary_mask].to(torch.float32)
+        x_ref_bdry[boundary_mask] = x_s_teach[boundary_mask]  # already float64
         sigma_ref_vec[boundary_mask] = sigma_s_eff[boundary_mask]
         
         # General interior edges: push from σ_s to σ_bdry using a denoiser at σ_s.
@@ -501,34 +495,26 @@ class EDMConsistencyDistillLoss:
             idx_g = general_mask
             with torch.no_grad():
                 if self.target_net is not None:
-                    # Use target network (EMA or teacher) at σ_s.
-                    # Note: if target_net is the teacher, we pass sigma_s_eff (1D) to match
-                    # the teacher's EDMPrecond interface; if it's the student EMA, we pass
-                    # sigma_s (4D broadcast). Both work because EDMPrecond accepts both shapes.
                     sigma_for_target = sigma_s_eff[idx_g] if self.target_net is self.teacher_net else sigma_s[idx_g]
                     x_hat_s_ng = self.target_net(
-                        x_s_teach[idx_g],
+                        x_s_teach[idx_g].float(),
                         sigma_for_target,
                         labels[idx_g] if labels is not None else None,
                         augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
-                    ).to(torch.float32)
+                    ).to(torch.float64)
                 else:
-                    # Standard path: use live STUDENT at σ_s.
-                    # Disable dropout/label_dropout for the target reference so the
-                    # inv-DDIM target is deterministic (matches ema/teacher modes
-                    # which are already .eval()).  Only GroupNorm is used (no running
-                    # stats), so eval/train toggle is safe.
                     net.eval()
                     x_hat_s_ng = net(
-                        x_s_teach[idx_g],
-                        sigma_s[idx_g],              # [N_g,1,1,1]
+                        x_s_teach[idx_g].float(),
+                        sigma_s[idx_g],
                         labels[idx_g] if labels is not None else None,
                         augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
-                    ).to(torch.float32)
+                    ).to(torch.float64)
                     net.train()
             
-            ratio_s_b = (sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)).to(torch.float32)
-            x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
+            # DDIM step in float64: x_ref = x̂_s + (σ_bdry/σ_s) * (x_s_teach - x̂_s)
+            ratio_s_b = sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)
+            x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g] - x_hat_s_ng)
             sigma_ref_vec[idx_g] = sigma_bdry_vec[idx_g]
 
         # Gain diagnostics: σ_ref / σ_t and CD gain 1 / (1 - σ_ref/σ_t).
@@ -536,12 +522,14 @@ class EDMConsistencyDistillLoss:
         ratio_ref = sigma_ref_vec / torch.clamp(sigma_t_vec, min=1e-12)
         gain = 1.0 / torch.clamp(1.0 - ratio_ref, min=1e-6)  # [N]
 
-        # Compute inv-DDIM target at t using per-sample sigma_ref (PRD §4.2.6)
+        # Compute inv-DDIM target at t using per-sample sigma_ref.
+        # All inputs are float64; inv_ddim_edm does its arithmetic in float64.
+        # Cast result to float32 only for the loss computation.
         try:
             x_hat_t_star = inv_ddim_edm(
-                x_ref=x_ref_bdry,
-                x_t=x_t,
-                sigma_t=sigma_t_vec,      # [N], standardize on 1D vectors
+                x_ref=x_ref_bdry,         # float64
+                x_t=x_t,                  # float64
+                sigma_t=sigma_t_vec,      # [N]
                 sigma_ref=sigma_ref_vec,  # [N]
             ).to(torch.float32)
         except ValueError as e:
@@ -560,8 +548,9 @@ class EDMConsistencyDistillLoss:
                 )
             raise ValueError(error_msg) from e
 
-        # Student prediction at t (net is back in .train() mode → dropout active)
-        x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
+        # Student prediction at t (net is back in .train() mode → dropout active).
+        # Network runs in float32; x_t is float64 so cast for the forward pass.
+        x_hat_t = net(x_t.float(), sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
 
         # Weighting and loss
         # _weight expects 1D sigma vector [N]

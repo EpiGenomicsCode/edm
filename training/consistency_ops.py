@@ -339,13 +339,12 @@ def sample_segment_and_teacher_pair(
 def _expand_sigma_to_bchw(sigma: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     """
     Ensure sigma broadcasts over BCHW. Accepts scalar/(), (N,), or already-broadcast shapes.
-    Returns tensor on like.device, float32.
+    Returns tensor on like.device with like.dtype.
     """
-    s = torch.as_tensor(sigma, device=like.device, dtype=torch.float32)
+    s = torch.as_tensor(sigma, device=like.device, dtype=like.dtype)
     if s.ndim == 0:
         s = s.reshape(1, 1, 1, 1)
     elif s.ndim == 1:
-        # (N,) -> (N,1,1,1)
         s = s.reshape(-1, 1, 1, 1)
     return s
 
@@ -361,17 +360,15 @@ def ddim_step_edm(
         x_s = x̂_t + (σ_s/σ_t) * (x_t - x̂_t)
     """
     assert x_t.shape == x_pred_t.shape, "x_t and x_pred_t must have the same shape"
-    # Work in float32 for stability; return in input dtype.
     out_dtype = x_t.dtype
-    x_t32 = x_t.to(torch.float32)
-    x_pred_t32 = x_pred_t.to(torch.float32)
-    sigma_t_b = _expand_sigma_to_bchw(sigma_t, x_t32)
-    sigma_s_b = _expand_sigma_to_bchw(sigma_s, x_t32)
-    # Guard against division by zero at σ=0 (should not be called with σ_t == 0).
+    x_t64 = x_t.to(torch.float64)
+    x_pred_t64 = x_pred_t.to(torch.float64)
+    sigma_t_b = _expand_sigma_to_bchw(sigma_t, x_t64)
+    sigma_s_b = _expand_sigma_to_bchw(sigma_s, x_t64)
     if torch.any(sigma_t_b == 0):
         raise ValueError("ddim_step_edm received sigma_t == 0. Avoid σ=0 in DDIM steps.")
     ratio = sigma_s_b / sigma_t_b
-    x_s = x_pred_t32 + ratio * (x_t32 - x_pred_t32)
+    x_s = x_pred_t64 + ratio * (x_t64 - x_pred_t64)
     return x_s.to(out_dtype)
 
 
@@ -382,16 +379,17 @@ def inv_ddim_edm(
     sigma_ref: torch.Tensor,
 ) -> torch.Tensor:
     """
-    EDM-space inverse-DDIM:
-        x̂*_t = [x_ref - (σ_ref/σ_t) x_t] / [1 - (σ_ref/σ_t)]
+    EDM-space inverse-DDIM (numerically stable form):
+        x̂*_t = (x_ref · σ_t − x_t · σ_ref) / (σ_t − σ_ref)
+
+    All arithmetic in float64 to avoid cancellation errors.
     """
     assert x_ref.shape == x_t.shape, "x_ref and x_t must have the same shape"
     out_dtype = x_t.dtype
-    x_ref32 = x_ref.to(torch.float32)
-    x_t32 = x_t.to(torch.float32)
-    sigma_t_b = _expand_sigma_to_bchw(sigma_t, x_t32)
-    sigma_ref_b = _expand_sigma_to_bchw(sigma_ref, x_t32)
-    # Guards: avoid division by zero or degenerate denominator (σ_ref == σ_t).
+    x_ref64 = x_ref.to(torch.float64)
+    x_t64 = x_t.to(torch.float64)
+    sigma_t_b = _expand_sigma_to_bchw(sigma_t, x_t64)
+    sigma_ref_b = _expand_sigma_to_bchw(sigma_ref, x_t64)
     if torch.any(sigma_t_b == 0):
         bad_idx = (sigma_t_b == 0).nonzero(as_tuple=False)[:, 0].unique()
         sigma_t_flat = sigma_t if sigma_t.ndim <= 1 else sigma_t_b[:, 0, 0, 0]
@@ -400,10 +398,9 @@ def inv_ddim_edm(
             f"inv_ddim_edm received sigma_t == 0. Avoid σ=0 when backsolving.\n"
             f"  Affected samples (first 5): {bad_vals}"
         )
-    ratio = sigma_ref_b / sigma_t_b
-    denom = 1.0 - ratio
-    if torch.any(denom.abs() < 1e-8):
-        bad_idx = (denom.abs() < 1e-8).nonzero(as_tuple=False)[:, 0].unique()
+    denom = sigma_t_b - sigma_ref_b
+    if torch.any(denom.abs() < 1e-12):
+        bad_idx = (denom.abs() < 1e-12).nonzero(as_tuple=False)[:, 0].unique()
         sigma_t_flat = sigma_t if sigma_t.ndim <= 1 else sigma_t_b[:, 0, 0, 0]
         sigma_ref_flat = sigma_ref if sigma_ref.ndim <= 1 else sigma_ref_b[:, 0, 0, 0]
         bad_vals = [
@@ -416,7 +413,7 @@ def inv_ddim_edm(
             f"    {bad_vals}\n"
             f"  This indicates sigma_ref and sigma_t are nearly equal, making the invDDIM formula degenerate."
         )
-    x_hat_star_t = (x_ref32 - ratio * x_t32) / denom
+    x_hat_star_t = (x_ref64 * sigma_t_b - x_t64 * sigma_ref_b) / denom
     return x_hat_star_t.to(out_dtype)
 
 
@@ -435,36 +432,34 @@ def heun_hop_edm(
         x_eul = x_t + (σ_s - σ_t) * k1
         k2 = (x_eul - D(x_eul; σ_s))/σ_s
         x_s = x_t + 0.5*(σ_s - σ_t)*(k1 + k2)
-    Never evaluates the net at σ=0. Assumes `net` has EDM interface: net(x, σ, labels, augment_labels).
+
+    All ODE arithmetic in float64; network evals in float32.
     """
     assert isinstance(x_t, torch.Tensor)
     out_dtype = x_t.dtype
-    x32 = x_t.to(torch.float32)
+    x64 = x_t.to(torch.float64)
 
-    # Round sigmas using network's policy and reshape/broadcast.
-    # Maintain the same device placement throughout.
-    sigma_t_r = net.round_sigma(torch.as_tensor(sigma_t, device=x32.device))
-    sigma_s_r = net.round_sigma(torch.as_tensor(sigma_s, device=x32.device))
-    sigma_t_b = _expand_sigma_to_bchw(sigma_t_r, x32)
-    sigma_s_b = _expand_sigma_to_bchw(sigma_s_r, x32)
+    sigma_t_r = net.round_sigma(torch.as_tensor(sigma_t, device=x64.device))
+    sigma_s_r = net.round_sigma(torch.as_tensor(sigma_s, device=x64.device))
+    sigma_t_b = _expand_sigma_to_bchw(sigma_t_r, x64)
+    sigma_s_b = _expand_sigma_to_bchw(sigma_s_r, x64)
 
-    # Never evaluate at σ=0.
     if torch.any(sigma_t_b == 0) or torch.any(sigma_s_b == 0):
         raise ValueError("heun_hop_edm received σ=0. Avoid σ=0 in teacher hops.")
 
-    # k1 at (x_t, σ_t).
-    denoised_t = net(x32, sigma_t_r, class_labels=class_labels, augment_labels=augment_labels).to(torch.float32)
-    k1 = (x32 - denoised_t) / sigma_t_b
+    # k1 at (x_t, σ_t).  Network runs in float32, output promoted to float64.
+    denoised_t = net(x64.float(), sigma_t_r, class_labels=class_labels, augment_labels=augment_labels).to(torch.float64)
+    k1 = (x64 - denoised_t) / sigma_t_b
 
     # Euler proposal to σ_s.
-    x_eul = x32 + (sigma_s_b - sigma_t_b) * k1
+    x_eul = x64 + (sigma_s_b - sigma_t_b) * k1
 
-    # k2 at (x_eul, σ_s).
-    denoised_s = net(x_eul, sigma_s_r, class_labels=class_labels, augment_labels=augment_labels).to(torch.float32)
+    # k2 at (x_eul, σ_s).  Network runs in float32, output promoted to float64.
+    denoised_s = net(x_eul.float(), sigma_s_r, class_labels=class_labels, augment_labels=augment_labels).to(torch.float64)
     k2 = (x_eul - denoised_s) / sigma_s_b
 
     # Heun update.
-    x_s = x32 + 0.5 * (sigma_s_b - sigma_t_b) * (k1 + k2)
+    x_s = x64 + 0.5 * (sigma_s_b - sigma_t_b) * (k1 + k2)
     return x_s.to(out_dtype)
 
 
