@@ -53,7 +53,6 @@ export LOCAL_RANK=0
 # Run training with torchrun and arguments per prompt
 torchrun --standalone --nproc_per_node=4 train.py \
   --outdir=training-runs/imagenet64-cd-s8 \
-  #--resume=/training-runs/imagenet64-cd-s8/00002-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/network-snapshot-000002.pkl \ 
   --data=/work/nvme/bbse/vmathew/edm_training/edm/datasets/imagenet-64x64.zip \
   --cond=1 --arch=adm --precond=edm \
   --batch=2048 --batch-gpu=64 --fp16=True --ema=50 --lr=8e-5 --ema_rampup=0.05 --grad-clip=0.0 \
@@ -73,9 +72,9 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --snap=20 \
   --dump=20 \
   --cd_target_mode=live \
-  # --cd_target_ema=0.95 \
   --val_ref=/work/nvme/bbse/vmathew/edm_training/edm/fid-refs/imagenet-64x64.npz \
   --val_steps=8 \
   --val_every=20 \
   --val_at_start=0 \
-  --dropout=0.0
+  --dropout=0.0 \
+    # --cd_target_ema=0.95 
