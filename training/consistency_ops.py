@@ -268,14 +268,12 @@ def compute_importance_weights(
 
 
 def sample_segment_and_teacher_pair(
-    boundaries: torch.Tensor,
+    sigma_bounds: torch.Tensor,
     teacher_sigmas: torch.Tensor,
     student_sigmas: torch.Tensor,
     batch_size: int,
     device: torch.device,
     generator: torch.Generator = None,
-    anchor_by_sigma: bool = True,
-    sigma_bounds: torch.Tensor = None,
     terminal_k: int = None,
     sampling_mode: str = "vp",
     rho: float = 7.0,
