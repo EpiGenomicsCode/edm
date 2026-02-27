@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=00:30:00
+#SBATCH --time=30:00:00
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
 
@@ -55,7 +55,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --outdir=training-runs/imagenet64-cd-s8 \
   --data=/work/nvme/bbse/vmathew/edm_training/edm/datasets/imagenet-64x64.zip \
   --cond=1 --arch=adm --precond=edm \
-  --batch=2048 --batch-gpu=128 --fp16=True --ema=50 --lr=2e-5 --ema_rampup=0.05 \
+  --batch=2048 --batch-gpu=64 --fp16=True --ema=50 --lr=8e-5 --ema_rampup=0.05 \
   --consistency=True \
   --sampling_mode=edm \
   --duration=410 \
@@ -66,14 +66,15 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --rho=7 --sigma_min=0.002 --sigma_max=80 \
   --cd_loss=pseudo_huber --cd_weight_mode=sqrt_karras \
   --wandb=True --wandb_project=edm-cd --wandb_entity=vinaysmathew-penn-state \
-  --wandb_run=imagenet64-cd-s8-DynEMA --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
+  --wandb_run=imagenet64-cd-s8-live-checkmerge --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
   --val=1 \
   --val_teacher=False \
   --snap=20 \
   --dump=20 \
-  --cd_target_mode=ema \
-  --cd_target_ema=0.95 \
+  --cd_target_mode=live \
+  # --cd_target_ema=0.95 \
   --val_ref=/work/nvme/bbse/vmathew/edm_training/edm/fid-refs/imagenet-64x64.npz \
   --val_steps=8 \
   --val_every=20 \
-  --val_at_start=1
+  --val_at_start=0 \
+  --dropout=0.0
