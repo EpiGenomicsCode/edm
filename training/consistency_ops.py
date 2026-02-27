@@ -82,6 +82,7 @@ def filter_teacher_edges_by_sigma(
     student_sigmas: torch.Tensor,
     teacher_sigmas: torch.Tensor,
     eps: float = 1e-5,
+    
 ) -> (torch.Tensor, int):
     """
     Build a CD-specific teacher grid by removing teacher edges whose upper sigma
@@ -283,66 +284,35 @@ def sample_segment_and_teacher_pair(
     terminal_anchor: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
-    Sample (j, k_t, k_s) for consistency distillation using MSCD-style SNT logic.
-        k-t left time stamp (smaller noise level) for calculating consistency loss.
-        k-s right time stamp (larger noise level) for calculating consistency loss.
-    
-    **Per-sample edge sampling**: Each element in the batch independently draws its own
-    edge (j, k_t, k_s) and corresponding sigmas. All returned tensors have shape [batch_size]
-    with independent draws per element (no replication).
+    Sample (j, k_t, k_s) for consistency distillation using sigma-anchored segments.
+
+    Segments are defined in sigma-space via sigma_bounds (from partition_edges_by_sigma).
+    Each element in the batch independently draws its own edge.
 
     Args:
-        boundaries: LongTensor of shape (S+1,) from partition_edges_into_segments
+        sigma_bounds: LongTensor of shape (S, 2) with [k_start, k_end] per segment
         teacher_sigmas: FloatTensor of shape (T+1,) with terminal 0
         student_sigmas: FloatTensor of shape (S+1,) with terminal 0
         batch_size: number of samples (each gets an independent edge)
         device: torch device
         generator: optional RNG
-        anchor_by_sigma: use sigma-anchored segmentation
-        sigma_bounds: precomputed bounds from partition_edges_by_sigma
         terminal_k: index of terminal teacher edge
-        sampling_mode: Edge sampling distribution mode:
-            - "uniform": Equal probability for all edges/segments
-            - "vp": VP/MSCD uniform-t (Half-Cauchy), ~88% FID-critical [0.1, 10]
-            - "edm": EDM's log-normal training distribution, ~82% in [0.1, 10]
-        rho: Karras schedule exponent for importance weight computation
-        P_mean: Log-normal mean (only for mode="edm"), default -1.2
-        P_std: Log-normal std (only for mode="edm"), default 1.2
+        sampling_mode: "uniform" | "vp" | "edm"
+        rho: Karras schedule exponent
+        P_mean: Log-normal mean (only for mode="edm")
+        P_std: Log-normal std (only for mode="edm")
+        terminal_anchor: anchor terminal edge to 1/T probability
 
     Returns:
-        Dict with:
-            step_j: segment indices [batch_size]
-            n_rel: relative edge index within segment [batch_size]
-            k_t, k_s: teacher edge indices [batch_size]
-            sigma_t, sigma_s, sigma_bdry: noise levels [batch_size]
-            is_terminal: bool mask [batch_size]
-            is_boundary_snap: bool mask [batch_size]
-
-    MSCD-style semantics:
-        - terminal: k_s == T (σ_s = 0)
-        - boundary_snap: first edge in segment (n_rel == 1), not last segment, not terminal
-        - general interior: all other edges
-
-    If anchor_by_sigma is True, segments are defined in sigma-space using sigma_bounds
-    (precomputed via partition_edges_by_sigma). Segment lengths may differ. n_rel=1
-    corresponds to the teacher edge closest to the student boundary (lowest sigma in
-    the segment), except for the terminal segment where terminal edges are flagged.
-    
-    Sampling modes:
-        - "uniform": Original uniform sampling (~46% FID-critical)
-        - "vp": Importance weights w(σ) ∝ σ^(1-1/ρ)/(1+σ²) to match MSCD's VP uniform-t (~88%)
-        - "edm": Importance weights to match EDM's log-normal training distribution (~82%)
-    
-    Note: Changing batch_size from 1 to N alters RNG consumption (N independent draws per call
-    vs 1 draw per call), which affects reproducibility vs legacy single-edge-per-batch behavior.
+        Dict with per-sample tensors [batch_size]:
+            step_j, n_rel, k_t, k_s, sigma_t, sigma_s, sigma_bdry,
+            is_terminal, is_boundary_snap
     """
-    S = len(boundaries) - 1
+    S = sigma_bounds.shape[0]
     T = len(teacher_sigmas) - 1
-    
-    boundaries = boundaries.to(device)
+    sigma_bounds = sigma_bounds.to(device)
     teacher_sigmas = teacher_sigmas.to(device)
-    
-    # Compute importance weights based on sampling mode
+
     use_importance = sampling_mode in ("vp", "edm")
     if use_importance:
         edge_weights = compute_importance_weights(
@@ -352,105 +322,39 @@ def sample_segment_and_teacher_pair(
     else:
         edge_weights = None
 
-    if anchor_by_sigma:
-        assert sigma_bounds is not None and sigma_bounds.shape == (S, 2)
-        sigma_bounds = sigma_bounds.to(device)
-        
-        if use_importance and edge_weights is not None:
-            # VECTORIZED importance sampling: sample edges directly, then map to segments
-            # This avoids slow per-sample Python loops that cause NCCL timeouts.
-            
-            # Step 1: Sample edges directly with importance weights (single batch multinomial)
-            k_t = torch.multinomial(edge_weights, batch_size, replacement=True, generator=generator)
-            
-            # Step 2: Map each sampled edge k_t to its segment j
-            # For sigma-anchored: segment j contains edges where sigma_bounds[j,0] <= k <= sigma_bounds[j,1]
-            # We use searchsorted on the lower bounds to find which segment each k_t belongs to
-            k_starts = sigma_bounds[:, 0].contiguous()  # [S], contiguous for searchsorted perf
-            k_ends = sigma_bounds[:, 1]    # [S]
-            
-            # Find segment j such that k_starts[j] <= k_t <= k_ends[j]
-            # Since segments are contiguous and non-overlapping, we can use the upper bound check
-            # step_j[i] = max j such that k_starts[j] <= k_t[i]
-            step_j = torch.searchsorted(k_starts, k_t, right=True) - 1
-            step_j = step_j.clamp(min=0, max=S-1)
-            
-            # Step 3: Compute n_rel (relative position within segment)
-            # n_rel = 1 means closest to lower boundary (k_end), higher = closer to k_start
-            k0 = k_starts[step_j]
-            k1 = k_ends[step_j]
-            seg_len_j = (k1 - k0 + 1).clamp(min=1)
-            
-            # local_idx = k_t - k0 (0 = at k_start, seg_len-1 = at k_end)
-            local_idx = k_t - k0
-            # n_rel: 1 = closest to boundary (k_end), seg_len = at k_start
-            n_rel = seg_len_j - local_idx
-            n_rel = n_rel.clamp(min=1)
-        else:
-            # Uniform segment sampling (original behavior)
-            step_j = torch.randint(low=0, high=S, size=(batch_size,), device=device, dtype=torch.long, generator=generator)
-            
-            k0 = sigma_bounds[step_j, 0]
-            k1 = sigma_bounds[step_j, 1]
-            seg_len_j = (k1 - k0 + 1).clamp(min=1)
-            
-            # Uniform within-segment sampling
-            u = torch.empty(batch_size, device=device, dtype=torch.float32)
-            if generator is not None:
-                u.uniform_(0.0, 1.0, generator=generator)
-            else:
-                u.uniform_(0.0, 1.0)
-            n_rel = torch.floor(u * seg_len_j.float() + 1.0).to(torch.long)
-            n_rel = torch.minimum(n_rel, seg_len_j)
-            # n_rel = 1 → closest to boundary (lowest sigma in segment) → k_t = k1
-            k_t = k1 - (n_rel - 1)
+    if use_importance and edge_weights is not None:
+        k_t = torch.multinomial(edge_weights, batch_size, replacement=True, generator=generator)
 
-        k_s = (k_t + 1).clamp(max=T)  # guard, though k_t<T by construction
+        k_starts = sigma_bounds[:, 0].contiguous()
+        k_ends = sigma_bounds[:, 1]
+
+        step_j = torch.searchsorted(k_starts, k_t, right=True) - 1
+        step_j = step_j.clamp(min=0, max=S-1)
+
+        k0 = k_starts[step_j]
+        k1 = k_ends[step_j]
+        seg_len_j = (k1 - k0 + 1).clamp(min=1)
+
+        local_idx = k_t - k0
+        n_rel = seg_len_j - local_idx
+        n_rel = n_rel.clamp(min=1)
     else:
-        # Index-anchored (original MSCD) segmentation.
-        seg_len = boundaries[1:] - boundaries[:-1]  # shape (S,)
-        
-        if use_importance and edge_weights is not None:
-            # VECTORIZED importance sampling: sample edges directly, then map to segments
-            # This avoids slow per-sample Python loops that cause NCCL timeouts.
-            
-            # Step 1: Sample edges directly with importance weights (single batch multinomial)
-            # Note: For index-anchored mode, edges go from 0 to T-1 (boundaries cover [0, T])
-            # We only sample from edges in valid segments (0 to T-1)
-            valid_edge_weights = edge_weights[:T]  # Exclude edge T (terminal boundary)
-            k_t = torch.multinomial(valid_edge_weights, batch_size, replacement=True, generator=generator)
-            
-            # Step 2: Map each sampled edge k_t to its segment j
-            # Segment j contains edges where boundaries[j] <= k < boundaries[j+1]
-            # Use searchsorted to find segment
-            step_j = torch.searchsorted(boundaries[1:], k_t, right=True)  # boundaries[1:] gives upper bounds
-            step_j = step_j.clamp(min=0, max=S-1)
-            
-            # Step 3: Compute n_rel (1-indexed position within segment)
-            # local_idx = k_t - boundaries[step_j]
-            seg_start = boundaries[step_j]
-            n_rel = (k_t - seg_start + 1).clamp(min=1)
-            
-            seg_len_j = seg_len[step_j]
+        step_j = torch.randint(low=0, high=S, size=(batch_size,), device=device, dtype=torch.long, generator=generator)
+
+        k0 = sigma_bounds[step_j, 0]
+        k1 = sigma_bounds[step_j, 1]
+        seg_len_j = (k1 - k0 + 1).clamp(min=1)
+
+        u = torch.empty(batch_size, device=device, dtype=torch.float32)
+        if generator is not None:
+            u.uniform_(0.0, 1.0, generator=generator)
         else:
-            # Uniform segment sampling (original behavior)
-            step_j = torch.randint(low=0, high=S, size=(batch_size,), device=device, dtype=torch.long, generator=generator)
-            seg_len_j = seg_len[step_j]  # shape (batch_size,)
-            
-            # Uniform within-segment sampling
-            u = torch.empty(batch_size, device=device, dtype=torch.float32)
-            if generator is not None:
-                u.uniform_(0.0, 1.0, generator=generator)
-            else:
-                u.uniform_(0.0, 1.0)
+            u.uniform_(0.0, 1.0)
+        n_rel = torch.floor(u * seg_len_j.float() + 1.0).to(torch.long)
+        n_rel = torch.minimum(n_rel, seg_len_j)
+        k_t = k1 - (n_rel - 1)
 
-            n_rel = torch.floor(u * seg_len_j.float() + 1.0).to(torch.long)
-            n_rel = torch.clamp(n_rel, min=1)
-            n_rel = torch.minimum(n_rel, seg_len_j)
-
-            k_t = boundaries[step_j] + (n_rel - 1)
-        
-        k_s = k_t + 1
+    k_s = (k_t + 1).clamp(max=T)
 
     # Gather sigmas
     sigma_t = teacher_sigmas[k_t]

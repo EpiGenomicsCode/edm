@@ -1,29 +1,14 @@
 import math
 import os
 import copy
-import json as _json_mod
-import time as _time_mod
 from typing import Optional, Tuple, Dict, List, Any
-from datetime import datetime
 
 import torch
 from torch_utils import persistence
 from torch_utils import training_stats
 
-# #region agent log — debug timing config
-_LCD_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.cursor', 'debug.log')
-def _lcd_log(payload):
-    try:
-        with open(_LCD_LOG_PATH, 'a') as _f:
-            _f.write(_json_mod.dumps(payload) + '\n')
-    except Exception:
-        pass
-_lcd_call_counter = 0
-# #endregion
-
 from .consistency_ops import (
     make_karras_sigmas,
-    partition_edges_into_segments,
     partition_edges_by_sigma,
     filter_teacher_edges_by_sigma,
     sample_segment_and_teacher_pair,
@@ -132,7 +117,6 @@ class EDMConsistencyDistillLoss:
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
         target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA or teacher)
-        anchor_by_sigma: bool = True,   # If True, segment teacher edges in sigma-space (closest-to-boundary first)
         sampling_mode: str = "vp",  # Edge sampling: "uniform" | "vp" (MSCD uniform-t) | "edm" (log-normal)
         terminal_anchor: bool = True,  # Anchor terminal edge to 1/T probability (matches MSCD paper)
         terminal_teacher_hop: bool = False,  # Use teacher Euler hop for terminal edge instead of clean image y
@@ -175,12 +159,10 @@ class EDMConsistencyDistillLoss:
         # - EMA copy of student: stabilizes training (OpenAI's approach, rate=0.95)
         # - Frozen teacher: for debugging
         self.target_net = target_net
-        self.anchor_by_sigma = bool(anchor_by_sigma)
         assert sampling_mode in ("uniform", "vp", "edm"), f"Invalid sampling_mode: {sampling_mode}"
         self.sampling_mode = sampling_mode
         self.terminal_anchor = bool(terminal_anchor)
         self.terminal_teacher_hop = bool(terminal_teacher_hop)
-        self.debug_log = os.environ.get('EDM_CD_DEBUG_LOG', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -364,9 +346,6 @@ class EDMConsistencyDistillLoss:
         """
         device = images.device
         batch_size = images.shape[0]
-        # #region agent log — timing start
-        _t_grid_start = _time_mod.time()
-        # #endregion
 
         # Optional augmentation (matches other losses).
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
@@ -377,72 +356,30 @@ class EDMConsistencyDistillLoss:
         # Full teacher grid from Karras schedule
         teacher_sigmas_full = self._build_teacher_grid(device=device)      # [T+1] with terminal 0
 
-        if self.anchor_by_sigma:
-            T_edges_int = self._current_T_edges()
-            if T_edges_int in self._filter_cache:
-                teacher_sigmas, terminal_k = self._filter_cache[T_edges_int]
-                teacher_sigmas = teacher_sigmas.to(device)
-            else:
-                teacher_sigmas, terminal_k = filter_teacher_edges_by_sigma(
-                    student_sigmas=student_sigmas,
-                    teacher_sigmas=teacher_sigmas_full,
-                )
-                self._filter_cache[T_edges_int] = (teacher_sigmas.clone(), terminal_k)
+        T_edges_int = self._current_T_edges()
+        if T_edges_int in self._filter_cache:
+            teacher_sigmas, terminal_k = self._filter_cache[T_edges_int]
+            teacher_sigmas = teacher_sigmas.to(device)
         else:
-            teacher_sigmas = teacher_sigmas_full
-            terminal_k = teacher_sigmas.shape[0] - 2  # last positive before terminal 0
-
-        # Now everything below uses the (maybe filtered) teacher_sigmas
-        T_edges = teacher_sigmas.shape[0] - 1  # number of edges in CD grid
-        # #region agent log — grid build done
-        _t_grid_elapsed = _time_mod.time() - _t_grid_start
-        # #endregion
-
-        # Optional debug logging (EDM_CD_DEBUG_LOG=1): teacher grid snapshot every 200 calls.
-        _fwd_cnt = getattr(self, '_dbg_fwd_counter', 0)
-        self._dbg_fwd_counter = _fwd_cnt + 1
-        if self.debug_log and _fwd_cnt % 200 == 0 and getattr(self, '_run_dir', None):
-            try:
-                _dbg_path = os.path.join(self._run_dir, 'debug.log')
-                _h1_payload = {
-                    'timestamp': int(datetime.now().timestamp() * 1000),
-                    'location': 'loss_cd.py:__call__:grid_setup',
-                    'message': 'H1 teacher grid snapshot',
-                    'hypothesisId': 'H1',
-                    'runId': 'initial',
-                    'data': {
-                        'T_edges': int(T_edges),
-                        'sigma_max': float(teacher_sigmas[0].cpu()),
-                        'sigma_min_pos': float(teacher_sigmas[-2].cpu()) if teacher_sigmas.shape[0] > 1 else None,
-                        'student_S': self.S,
-                        'fwd_call': _fwd_cnt,
-                    }
-                }
-                with open(_dbg_path, 'a') as _dbf:
-                    _dbf.write(_json_mod.dumps(_h1_payload) + '\n')
-            except Exception:
-                pass
-        # #endregion
-
-        # Index-based segment boundaries (for index-anchored path)
-        boundaries = partition_edges_into_segments(T=T_edges, S=self.S)
-
-        sigma_bounds = None
-        if self.anchor_by_sigma:
-            sigma_bounds = partition_edges_by_sigma(
+            teacher_sigmas, terminal_k = filter_teacher_edges_by_sigma(
                 student_sigmas=student_sigmas,
-                teacher_sigmas=teacher_sigmas,  # already filtered & strictly descending
+                teacher_sigmas=teacher_sigmas_full,
             )
+            self._filter_cache[T_edges_int] = (teacher_sigmas.clone(), terminal_k)
 
-        # Sample per-sample edges: each element in batch gets independent (j, k_t, k_s, sigmas).
+        T_edges = teacher_sigmas.shape[0] - 1
+
+        sigma_bounds = partition_edges_by_sigma(
+            student_sigmas=student_sigmas,
+            teacher_sigmas=teacher_sigmas,
+        )
+
         sample_dict = sample_segment_and_teacher_pair(
-            boundaries=boundaries,
+            sigma_bounds=sigma_bounds,
             teacher_sigmas=teacher_sigmas,
             student_sigmas=student_sigmas,
-            batch_size=batch_size,         # per-sample sampling (PRD §4.2.1)
+            batch_size=batch_size,
             device=device,
-            anchor_by_sigma=self.anchor_by_sigma,
-            sigma_bounds=sigma_bounds,
             terminal_k=terminal_k,
             sampling_mode=self.sampling_mode,
             rho=self.rho,
@@ -577,12 +514,18 @@ class EDMConsistencyDistillLoss:
                     ).to(torch.float32)
                 else:
                     # Standard path: use live STUDENT at σ_s.
+                    # Disable dropout/label_dropout for the target reference so the
+                    # inv-DDIM target is deterministic (matches ema/teacher modes
+                    # which are already .eval()).  Only GroupNorm is used (no running
+                    # stats), so eval/train toggle is safe.
+                    net.eval()
                     x_hat_s_ng = net(
                         x_s_teach[idx_g],
                         sigma_s[idx_g],              # [N_g,1,1,1]
                         labels[idx_g] if labels is not None else None,
                         augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
                     ).to(torch.float32)
+                    net.train()
             
             ratio_s_b = (sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)).to(torch.float32)
             x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
@@ -617,44 +560,7 @@ class EDMConsistencyDistillLoss:
                 )
             raise ValueError(error_msg) from e
 
-        # Optional debug logging (EDM_CD_DEBUG_LOG=1): invDDIM target diagnostics every 200 calls.
-        if self.debug_log and _fwd_cnt % 200 == 0 and getattr(self, '_run_dir', None):
-            try:
-                _dbg_path = os.path.join(self._run_dir, 'debug.log')
-                _target_norm = float(torch.sqrt((x_hat_t_star ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _ref_norm = float(torch.sqrt((x_ref_bdry ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _y_norm = float(torch.sqrt((y ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _target_y_err = float(torch.sqrt(((x_hat_t_star - y) ** 2).sum(dim=[1,2,3]).clamp(min=1e-12)).mean().detach().cpu())
-                _h23_payload = {
-                    'timestamp': int(datetime.now().timestamp() * 1000),
-                    'location': 'loss_cd.py:__call__:invDDIM_target',
-                    'message': 'H2/H3 invDDIM target quality',
-                    'hypothesisId': 'H2_H3',
-                    'runId': 'initial',
-                    'data': {
-                        'target_norm_mean': _target_norm,
-                        'ref_bdry_norm_mean': _ref_norm,
-                        'clean_image_norm_mean': _y_norm,
-                        'target_vs_clean_err': _target_y_err,
-                        'gain_mean': float(gain.mean().detach().cpu()),
-                        'gain_max': float(gain.max().detach().cpu()),
-                        'ratio_ref_mean': float(ratio_ref.mean().detach().cpu()),
-                        'ratio_ref_max': float(ratio_ref.max().detach().cpu()),
-                        'sigma_ref_mean': float(sigma_ref_vec.mean().detach().cpu()),
-                        'sigma_t_mean': float(sigma_t_vec.mean().detach().cpu()),
-                        'fwd_call': _fwd_cnt,
-                        'num_terminal': int(is_terminal.sum().item()),
-                        'num_boundary': int(is_boundary_snap.sum().item()),
-                        'num_general': int(is_general.sum().item()),
-                    }
-                }
-                with open(_dbg_path, 'a') as _dbf:
-                    _dbf.write(_json_mod.dumps(_h23_payload) + '\n')
-            except Exception:
-                pass
-        # #endregion
-
-        # Student prediction at t (PRD §4.2.7)
+        # Student prediction at t (net is back in .train() mode → dropout active)
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
 
         # Weighting and loss
@@ -699,9 +605,6 @@ class EDMConsistencyDistillLoss:
         self._count_general_edges += num_general
 
         # Training stats reporting: batch means (PRD §4.2.9)
-        # #region agent log — stats block timing
-        _t_stats_start = _time_mod.time()
-        # #endregion
         if self.enable_stats:
             with torch.no_grad():
                 # Core loss and sigma diagnostics.
@@ -835,8 +738,62 @@ class EDMConsistencyDistillLoss:
                     l2_boundary.max() if l2_boundary.numel() > 0 else [],
                 )
                 
-                # DIAGNOSTIC 2&3 REMOVED — full teacher forward pass (0.207s/call)
-                # was pure monitoring overhead. Use DIAGNOSTIC 7 for denoising quality.
+                # =========================================================================
+                # DIAGNOSTIC 2 & 3: Teacher vs Student output comparison
+                # =========================================================================
+                # Compute teacher's denoised estimate at sigma_t for ALL samples (single forward pass)
+                with torch.no_grad():
+                    x_hat_t_teacher = self.teacher_net(
+                        x_t,
+                        sigma_t_vec,
+                        labels,
+                        augment_labels=augment_labels,
+                    ).to(torch.float32)
+                
+                # Student-Teacher divergence at sigma_t (per-sample)
+                diff_st = x_hat_t - x_hat_t_teacher
+                st_divergence = torch.sqrt((diff_st * diff_st).sum(dim=[1, 2, 3]).clamp(min=1e-12))  # [N]
+                
+                # Overall divergence stats
+                training_stats.report('CD/student_teacher_divergence', st_divergence.mean())
+                training_stats.report('CD/student_teacher_divergence_max', st_divergence.max())
+                
+                # Divergence by edge type
+                training_stats.report(
+                    'CD/st_div_terminal',
+                    st_divergence[is_terminal].mean() if is_terminal.any() else [],
+                )
+                training_stats.report(
+                    'CD/st_div_boundary',
+                    st_divergence[is_boundary_snap].mean() if is_boundary_snap.any() else [],
+                )
+                training_stats.report(
+                    'CD/st_div_general',
+                    st_divergence[general_mask].mean() if general_mask.any() else [],
+                )
+                
+                # Additional boundary-specific diagnostics (using the already-computed x_hat_t_teacher)
+                if is_boundary_snap.any():
+                    idx_b = is_boundary_snap
+                    
+                    # Boundary-specific divergence (reuse from above)
+                    training_stats.report('CD/student_teacher_div_boundary', st_divergence[idx_b].mean())
+                    training_stats.report('CD/student_teacher_div_boundary_max', st_divergence[idx_b].max())
+                    
+                    # Teacher's output to ground truth (x_0 = y) for boundary edges
+                    diff_teacher_gt = x_hat_t_teacher[idx_b] - y[idx_b]
+                    teacher_gt_error = torch.sqrt((diff_teacher_gt * diff_teacher_gt).sum(dim=[1, 2, 3]).clamp(min=1e-12))
+                    training_stats.report('CD/teacher_gt_error_boundary', teacher_gt_error.mean())
+                    
+                    # Student's output to ground truth for boundary edges
+                    diff_student_gt = x_hat_t[idx_b] - y[idx_b]
+                    student_gt_error = torch.sqrt((diff_student_gt * diff_student_gt).sum(dim=[1, 2, 3]).clamp(min=1e-12))
+                    training_stats.report('CD/student_gt_error_boundary', student_gt_error.mean())
+                else:
+                    training_stats.report('CD/student_teacher_div_boundary', [])
+                    training_stats.report('CD/student_teacher_div_boundary_max', [])
+                    training_stats.report('CD/teacher_gt_error_boundary', [])
+                    training_stats.report('CD/student_gt_error_boundary', [])
                 
                 # =========================================================================
                 # DIAGNOSTIC 4: Gradient contribution analysis
@@ -855,9 +812,58 @@ class EDMConsistencyDistillLoss:
                 training_stats.report('CD/grad_frac_boundary', boundary_contrib / (total_weighted_loss + eps_frac))
                 training_stats.report('CD/grad_frac_general', general_contrib / (total_weighted_loss + eps_frac))
                 
-                # DIAGNOSTIC 5 REMOVED — depended on the removed teacher forward pass.
+                # =========================================================================
+                # DIAGNOSTIC 5: Target consistency check
+                # =========================================================================
+                # For boundary snap: is the target (x_hat_t_star) close to what teacher would produce?
+                # The target is computed from inv_ddim using x_ref = teacher's hop result
+                # If student is drifting, target quality might degrade
+                if is_boundary_snap.any():
+                    idx_b = is_boundary_snap
+                    # Target-Teacher divergence: how different is our target from teacher's direct estimate?
+                    diff_target_teacher = x_hat_t_star[idx_b] - x_hat_t_teacher[idx_b]
+                    target_teacher_div = torch.sqrt((diff_target_teacher * diff_target_teacher).sum(dim=[1, 2, 3]).clamp(min=1e-12))
+                    training_stats.report('CD/target_teacher_div_boundary', target_teacher_div.mean())
+                    
+                    # Target-GT divergence
+                    diff_target_gt = x_hat_t_star[idx_b] - y[idx_b]
+                    target_gt_div = torch.sqrt((diff_target_gt * diff_target_gt).sum(dim=[1, 2, 3]).clamp(min=1e-12))
+                    training_stats.report('CD/target_gt_div_boundary', target_gt_div.mean())
+                else:
+                    training_stats.report('CD/target_teacher_div_boundary', [])
+                    training_stats.report('CD/target_gt_div_boundary', [])
                 
-                # DIAGNOSTIC 6 REMOVED — expensive flatten/mean over [N, C*H*W].
+                # =========================================================================
+                # DIAGNOSTIC 6: Gradient direction conflict analysis
+                # =========================================================================
+                # Check if boundary and general edges are pushing the student in conflicting directions
+                # We use the student-target difference (diff) as a proxy for the gradient direction
+                # Positive cosine similarity = aligned, Negative = conflicting
+                if is_boundary_snap.any() and general_mask.any():
+                    # Flatten diff to [N, D] where D = C*H*W
+                    diff_flat = diff.view(batch_size, -1)  # [N, D]
+                    
+                    # Mean gradient direction for boundary edges
+                    boundary_grad_dir = diff_flat[is_boundary_snap].mean(dim=0)  # [D]
+                    boundary_grad_norm = torch.sqrt((boundary_grad_dir * boundary_grad_dir).sum().clamp(min=1e-12))
+                    
+                    # Mean gradient direction for general edges
+                    general_grad_dir = diff_flat[general_mask].mean(dim=0)  # [D]
+                    general_grad_norm = torch.sqrt((general_grad_dir * general_grad_dir).sum().clamp(min=1e-12))
+                    
+                    # Cosine similarity between boundary and general gradient directions
+                    cosine_sim = (boundary_grad_dir * general_grad_dir).sum() / (boundary_grad_norm * general_grad_norm + 1e-12)
+                    training_stats.report('CD/grad_conflict_boundary_general', cosine_sim)
+                    
+                    # Also track the relative magnitude of boundary vs general gradients
+                    training_stats.report('CD/grad_norm_boundary', boundary_grad_norm)
+                    training_stats.report('CD/grad_norm_general', general_grad_norm)
+                    training_stats.report('CD/grad_norm_ratio_boundary_general', boundary_grad_norm / (general_grad_norm + 1e-12))
+                else:
+                    training_stats.report('CD/grad_conflict_boundary_general', [])
+                    training_stats.report('CD/grad_norm_boundary', [])
+                    training_stats.report('CD/grad_norm_general', [])
+                    training_stats.report('CD/grad_norm_ratio_boundary_general', [])
 
                 # =========================================================================
                 # DIAGNOSTIC 7: Per-sigma-bucket denoising quality (H2 test)
@@ -906,92 +912,110 @@ class EDMConsistencyDistillLoss:
                 training_stats.report('CD/frac_general', torch.as_tensor(float(num_general) / max(num_edges, 1), device=device))
 
                 # Cache last-step diagnostics for optional per-optimizer-step logging.
-                # FIX H2: only build when the training loop sets
-                # _collect_step_metrics=True, avoiding 30+ GPU→CPU syncs per
-                # forward call on non-metric steps.
                 try:
-                    if getattr(self, '_collect_step_metrics', False):
-                        self._last_step_metrics = {
-                            'cd_gain_mean': float(gain.mean().detach().cpu()),
-                            'cd_gain_max': float(gain.max().detach().cpu()),
-                            'cd_gain_95p': float(gain.quantile(0.95).detach().cpu()),
-                            'cd_gain_99p': float(gain.quantile(0.99).detach().cpu()),
-                            'cd_gain_terminal_mean': float(gain_terminal.mean().detach().cpu()) if gain_terminal.numel() > 0 else None,
-                            'cd_gain_boundary_mean': float(gain_boundary.mean().detach().cpu()) if gain_boundary.numel() > 0 else None,
-                            'cd_gain_general_mean': float(gain_general.mean().detach().cpu()) if gain_general.numel() > 0 else None,
-                            'cd_loss_mean': float(loss_mean_per_sample.mean().detach().cpu()),
-                            'cd_loss_gain_corr': float((gain * loss_mean_per_sample).mean().detach().cpu()),
-                            'cd_l2_error_all': float(per_sample_l2_sqrt.mean().detach().cpu()),
-                            'cd_l2_error_terminal': float(l2_terminal.mean().detach().cpu()) if l2_terminal.numel() > 0 else None,
-                            'cd_l2_error_boundary': float(l2_boundary.mean().detach().cpu()) if l2_boundary.numel() > 0 else None,
-                            'cd_l2_error_general': float(l2_general.mean().detach().cpu()) if l2_general.numel() > 0 else None,
-                            'cd_grad_frac_terminal': float((terminal_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
-                            'cd_grad_frac_boundary': float((boundary_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
-                            'cd_grad_frac_general': float((general_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
-                        }
-                        self._last_step_metrics['cd_spike_count'] = num_spikes
-                        self._last_step_metrics['cd_spike_frac'] = float(num_spikes) / max(batch_size, 1)
-                        if num_spikes > 0:
-                            self._last_step_metrics['cd_spike_loss_mean'] = float(spike_losses.mean().detach().cpu())
-                            self._last_step_metrics['cd_spike_loss_max'] = float(spike_losses.max().detach().cpu())
-                            spike_terminal = (is_spike & is_terminal).sum().float()
-                            spike_boundary = (is_spike & is_boundary_snap).sum().float()
-                            spike_general  = (is_spike & general_mask).sum().float()
-                            self._last_step_metrics['cd_spike_pct_terminal'] = float(spike_terminal / max(num_spikes, 1))
-                            self._last_step_metrics['cd_spike_pct_boundary'] = float(spike_boundary / max(num_spikes, 1))
-                            self._last_step_metrics['cd_spike_pct_general'] = float(spike_general / max(num_spikes, 1))
-                            self._last_step_metrics['cd_spike_sigma_t_mean'] = float(sigma_t_vec[is_spike].mean().detach().cpu())
-                            self._last_step_metrics['cd_spike_gain_mean'] = float(gain[is_spike].mean().detach().cpu())
-                            self._last_step_metrics['cd_spike_gain_max'] = float(gain[is_spike].max().detach().cpu())
-                            self._last_step_metrics['cd_spike_seg_id_mean'] = float(j[is_spike].float().mean().detach().cpu())
-                            self._last_step_metrics['cd_spike_weight_mean'] = float(weight.view(-1)[is_spike].mean().detach().cpu())
-                        else:
-                            for _k in ('cd_spike_loss_mean', 'cd_spike_loss_max',
-                                       'cd_spike_pct_terminal', 'cd_spike_pct_boundary', 'cd_spike_pct_general',
-                                       'cd_spike_sigma_t_mean', 'cd_spike_gain_mean', 'cd_spike_gain_max',
-                                       'cd_spike_seg_id_mean', 'cd_spike_weight_mean'):
-                                self._last_step_metrics[_k] = None
-                        self._last_step_metrics['cd_denoise_quality_all'] = float(denoise_err.mean().detach().cpu())
-                        for bname, lo, hi in zip(bucket_names, bucket_lo, bucket_hi):
-                            mask_b = (sigma_flat >= lo) & (sigma_flat < hi)
-                            self._last_step_metrics[f'cd_denoise_q_{bname}'] = float(denoise_err[mask_b].mean().detach().cpu()) if mask_b.any() else None
-                        if general_mask.any():
-                            ddim_ratio_gen = (sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=1e-12)).squeeze()
-                            self._last_step_metrics['cd_ddim_ratio_gen_mean'] = float(ddim_ratio_gen.mean().detach().cpu())
-                            self._last_step_metrics['cd_ddim_ratio_gen_min'] = float(ddim_ratio_gen.min().detach().cpu())
-                            self._last_step_metrics['cd_ddim_frac_self_ref'] = float((ddim_ratio_gen < 0.1).float().mean().detach().cpu())
-                        else:
-                            self._last_step_metrics['cd_ddim_ratio_gen_mean'] = None
-                            self._last_step_metrics['cd_ddim_ratio_gen_min'] = None
-                            self._last_step_metrics['cd_ddim_frac_self_ref'] = None
-                        self._last_step_metrics['cd_frac_terminal'] = float(num_terminal) / max(num_edges, 1)
-                        self._last_step_metrics['cd_frac_boundary'] = float(num_boundary) / max(num_edges, 1)
-                        self._last_step_metrics['cd_frac_general'] = float(num_general) / max(num_edges, 1)
+                    self._last_step_metrics = {
+                        # Original gain metrics
+                        'cd_gain_mean': float(gain.mean().detach().cpu()),
+                        'cd_gain_max': float(gain.max().detach().cpu()),
+                        'cd_gain_95p': float(gain.quantile(0.95).detach().cpu()),
+                        'cd_gain_99p': float(gain.quantile(0.99).detach().cpu()),
+                        'cd_gain_terminal_mean': float(gain_terminal.mean().detach().cpu()) if gain_terminal.numel() > 0 else None,
+                        'cd_gain_boundary_mean': float(gain_boundary.mean().detach().cpu()) if gain_boundary.numel() > 0 else None,
+                        'cd_gain_general_mean': float(gain_general.mean().detach().cpu()) if gain_general.numel() > 0 else None,
+                        'cd_loss_mean': float(loss_mean_per_sample.mean().detach().cpu()),
+                        'cd_loss_gain_corr': float((gain * loss_mean_per_sample).mean().detach().cpu()),
+                        
+                        # DIAGNOSTIC 1: Per-edge L2 error
+                        'cd_l2_error_all': float(per_sample_l2_sqrt.mean().detach().cpu()),
+                        'cd_l2_error_terminal': float(l2_terminal.mean().detach().cpu()) if l2_terminal.numel() > 0 else None,
+                        'cd_l2_error_boundary': float(l2_boundary.mean().detach().cpu()) if l2_boundary.numel() > 0 else None,
+                        'cd_l2_error_general': float(l2_general.mean().detach().cpu()) if l2_general.numel() > 0 else None,
+                        
+                        # DIAGNOSTIC 3: Student-Teacher divergence
+                        'cd_st_divergence': float(st_divergence.mean().detach().cpu()),
+                        'cd_st_divergence_max': float(st_divergence.max().detach().cpu()),
+                        'cd_st_div_terminal': float(st_divergence[is_terminal].mean().detach().cpu()) if is_terminal.any() else None,
+                        'cd_st_div_boundary': float(st_divergence[is_boundary_snap].mean().detach().cpu()) if is_boundary_snap.any() else None,
+                        'cd_st_div_general': float(st_divergence[general_mask].mean().detach().cpu()) if general_mask.any() else None,
+                        
+                        # DIAGNOSTIC 4: Gradient fraction
+                        'cd_grad_frac_terminal': float((terminal_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
+                        'cd_grad_frac_boundary': float((boundary_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
+                        'cd_grad_frac_general': float((general_contrib / (total_weighted_loss + eps_frac)).detach().cpu()),
+                    }
+                    
+                    # DIAGNOSTIC 0: Loss spike analysis
+                    self._last_step_metrics['cd_spike_count'] = num_spikes
+                    self._last_step_metrics['cd_spike_frac'] = float(num_spikes) / max(batch_size, 1)
+                    if num_spikes > 0:
+                        self._last_step_metrics['cd_spike_loss_mean'] = float(spike_losses.mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_loss_max'] = float(spike_losses.max().detach().cpu())
+                        spike_terminal = (is_spike & is_terminal).sum().float()
+                        spike_boundary = (is_spike & is_boundary_snap).sum().float()
+                        spike_general  = (is_spike & general_mask).sum().float()
+                        self._last_step_metrics['cd_spike_pct_terminal'] = float(spike_terminal / max(num_spikes, 1))
+                        self._last_step_metrics['cd_spike_pct_boundary'] = float(spike_boundary / max(num_spikes, 1))
+                        self._last_step_metrics['cd_spike_pct_general'] = float(spike_general / max(num_spikes, 1))
+                        self._last_step_metrics['cd_spike_sigma_t_mean'] = float(sigma_t_vec[is_spike].mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_gain_mean'] = float(gain[is_spike].mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_gain_max'] = float(gain[is_spike].max().detach().cpu())
+                        self._last_step_metrics['cd_spike_seg_id_mean'] = float(j[is_spike].float().mean().detach().cpu())
+                        self._last_step_metrics['cd_spike_weight_mean'] = float(weight.view(-1)[is_spike].mean().detach().cpu())
                     else:
-                        self._last_step_metrics = {}
+                        self._last_step_metrics['cd_spike_loss_mean'] = None
+                        self._last_step_metrics['cd_spike_loss_max'] = None
+                        self._last_step_metrics['cd_spike_pct_terminal'] = None
+                        self._last_step_metrics['cd_spike_pct_boundary'] = None
+                        self._last_step_metrics['cd_spike_pct_general'] = None
+                        self._last_step_metrics['cd_spike_sigma_t_mean'] = None
+                        self._last_step_metrics['cd_spike_gain_mean'] = None
+                        self._last_step_metrics['cd_spike_gain_max'] = None
+                        self._last_step_metrics['cd_spike_seg_id_mean'] = None
+                        self._last_step_metrics['cd_spike_weight_mean'] = None
+
+                    # DIAGNOSTIC 6: Gradient conflict (only if both boundary and general exist)
+                    if is_boundary_snap.any() and general_mask.any():
+                        diff_flat = diff.view(batch_size, -1)
+                        boundary_grad_dir = diff_flat[is_boundary_snap].mean(dim=0)
+                        boundary_grad_norm = torch.sqrt((boundary_grad_dir * boundary_grad_dir).sum().clamp(min=1e-12))
+                        general_grad_dir = diff_flat[general_mask].mean(dim=0)
+                        general_grad_norm = torch.sqrt((general_grad_dir * general_grad_dir).sum().clamp(min=1e-12))
+                        cosine_sim = (boundary_grad_dir * general_grad_dir).sum() / (boundary_grad_norm * general_grad_norm + 1e-12)
+                        self._last_step_metrics['cd_grad_conflict'] = float(cosine_sim.detach().cpu())
+                        self._last_step_metrics['cd_grad_norm_boundary'] = float(boundary_grad_norm.detach().cpu())
+                        self._last_step_metrics['cd_grad_norm_general'] = float(general_grad_norm.detach().cpu())
+                        self._last_step_metrics['cd_grad_norm_ratio'] = float((boundary_grad_norm / (general_grad_norm + 1e-12)).detach().cpu())
+                    else:
+                        self._last_step_metrics['cd_grad_conflict'] = None
+                        self._last_step_metrics['cd_grad_norm_boundary'] = None
+                        self._last_step_metrics['cd_grad_norm_general'] = None
+                        self._last_step_metrics['cd_grad_norm_ratio'] = None
+
+                    # DIAGNOSTIC 7: Per-sigma-bucket denoising quality
+                    self._last_step_metrics['cd_denoise_quality_all'] = float(denoise_err.mean().detach().cpu())
+                    for bname, lo, hi in zip(bucket_names, bucket_lo, bucket_hi):
+                        mask_b = (sigma_flat >= lo) & (sigma_flat < hi)
+                        self._last_step_metrics[f'cd_denoise_q_{bname}'] = float(denoise_err[mask_b].mean().detach().cpu()) if mask_b.any() else None
+
+                    # DIAGNOSTIC 8: DDIM ratio for general edges
+                    if general_mask.any():
+                        ddim_ratio_gen = (sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=1e-12)).squeeze()
+                        self._last_step_metrics['cd_ddim_ratio_gen_mean'] = float(ddim_ratio_gen.mean().detach().cpu())
+                        self._last_step_metrics['cd_ddim_ratio_gen_min'] = float(ddim_ratio_gen.min().detach().cpu())
+                        self._last_step_metrics['cd_ddim_frac_self_ref'] = float((ddim_ratio_gen < 0.1).float().mean().detach().cpu())
+                    else:
+                        self._last_step_metrics['cd_ddim_ratio_gen_mean'] = None
+                        self._last_step_metrics['cd_ddim_ratio_gen_min'] = None
+                        self._last_step_metrics['cd_ddim_frac_self_ref'] = None
+
+                    # DIAGNOSTIC 9: Edge type fractions
+                    self._last_step_metrics['cd_frac_terminal'] = float(num_terminal) / max(num_edges, 1)
+                    self._last_step_metrics['cd_frac_boundary'] = float(num_boundary) / max(num_edges, 1)
+                    self._last_step_metrics['cd_frac_general'] = float(num_general) / max(num_edges, 1)
                 except Exception:
+                    # Diagnostics are best-effort only; do not break training if something goes wrong.
                     self._last_step_metrics = getattr(self, '_last_step_metrics', None)
 
-        # #region agent log — stats block done + emit timing
-        _t_stats_elapsed = _time_mod.time() - _t_stats_start
-        global _lcd_call_counter
-        _lcd_call_counter += 1
-        if _lcd_call_counter % 10 == 0:
-            _lcd_log({
-                'timestamp': int(datetime.now().timestamp() * 1000),
-                'location': 'loss_cd.py:__call__:timing',
-                'message': 'forward_pass_timing',
-                'hypothesisId': 'H1_H2',
-                'runId': 'post-fix',
-                'data': {
-                    'call': _lcd_call_counter,
-                    'grid_build_s': round(_t_grid_elapsed, 5),
-                    'stats_block_s': round(_t_stats_elapsed, 5),
-                    'diag_teacher_fwd_s': 0.0,
-                    'batch_size': batch_size,
-                    'T_edges': T_edges,
-                    'enable_stats': self.enable_stats,
-                },
-            })
-        # #endregion
         return loss
+
+

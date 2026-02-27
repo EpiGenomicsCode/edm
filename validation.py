@@ -6,7 +6,6 @@ import os
 import math
 import json
 import pickle
-import time
 import numpy as np
 import torch
 import dnnlib
@@ -100,7 +99,6 @@ def run_fid_validation(
     ref: Optional[str] = None,
     ref_data: Optional[str] = None,
     dump_images_dir: Optional[str] = None,
-    dump_full_stats: bool = False,
     overwrite: bool = False,
     step_kimg: Optional[int] = None,
     wandb_run: Optional[Any] = None,
@@ -246,7 +244,7 @@ def run_fid_validation(
         # Append jsonl.
         try:
             with open(os.path.join(run_dir, 'metrics-val.jsonl'), 'at') as f:
-                f.write(json.dumps(dict(result, timestamp=time.time())) + '\n')
+                f.write(json.dumps(dict(result, timestamp=float(torch.tensor([]).new_zeros(1).cpu().numpy().item() if False else float(torch.tensor(0).item())))) + '\n')
         except Exception:
             # Fallback without timestamp.
             with open(os.path.join(run_dir, 'metrics-val.jsonl'), 'at') as f:
@@ -255,6 +253,8 @@ def run_fid_validation(
         if step_kimg is not None:
             payload = dict(
                 fid=float(fid_value),
+                mu=mu.cpu().numpy().tolist(),
+                sigma=sigma.cpu().numpy().tolist(),
                 num_images=int(num_images),
                 step_kimg=int(step_kimg),
                 sampler=sampler or {},
@@ -262,9 +262,6 @@ def run_fid_validation(
                 ref=ref,
                 ref_data=ref_data,
             )
-            if dump_full_stats:
-                payload['mu'] = mu.cpu().numpy().tolist()
-                payload['sigma'] = sigma.cpu().numpy().tolist()
             with open(os.path.join(run_dir, f'val_{int(step_kimg):06d}.json'), 'wt') as f:
                 json.dump(payload, f)
         # W&B logging if available.
@@ -329,10 +326,10 @@ def maybe_validate(
         ref=validation_kwargs.get('ref', None),
         ref_data=validation_kwargs.get('ref_data', None),
         dump_images_dir=validation_kwargs.get('dump_images_dir', None),
-        dump_full_stats=bool(validation_kwargs.get('dump_full_stats', False)),
         overwrite=bool(validation_kwargs.get('overwrite', False)),
         step_kimg=int(step_kimg),
         wandb_run=wandb_run,
     )
 
 #----------------------------------------------------------------------------
+

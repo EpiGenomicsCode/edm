@@ -74,7 +74,6 @@ def parse_int_list(s):
 @click.option('--sampling_mode', help='Edge sampling distribution: uniform|vp (MSCD)|edm (log-normal)', metavar='STR', type=click.Choice(['uniform', 'vp', 'edm']), default='vp', show_default=True)
 @click.option('--terminal_anchor/--no_terminal_anchor', help='Anchor terminal edge (σ_min→0) to 1/T probability matching MSCD paper', default=True, show_default=True)
 @click.option('--terminal_teacher_hop/--no_terminal_teacher_hop', help='Terminal edge uses teacher Euler hop D(x_t,σ_min) instead of clean image y', default=False, show_default=True)
-@click.option('--cd_enable_stats', help='Enable expensive per-step CD diagnostics/stats', metavar='BOOL', type=bool, default=False, show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -94,8 +93,7 @@ def parse_int_list(s):
 @click.option('--ls',            help='Loss scaling', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
 @click.option('--bench',         help='Enable cuDNN benchmarking', metavar='BOOL',                  type=bool, default=True, show_default=True)
 @click.option('--cache',         help='Cache dataset in CPU memory', metavar='BOOL',                type=bool, default=True, show_default=True)
-@click.option('--workers',       help='DataLoader worker processes', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--step_metrics_every', help='Log per-step JSONL/W&B metrics every N steps (0=off)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
+@click.option('--workers',       help='DataLoader worker processes', metavar='INT',                 type=click.IntRange(min=1), default=1, show_default=True)
 
 # I/O-related.
 @click.option('--desc',          help='String to include in result dir name', metavar='STR',        type=str)
@@ -127,7 +125,6 @@ def parse_int_list(s):
 @click.option('--val_sampler',   help='Sampler kind', metavar='edm|ablate',                          type=click.Choice(['edm','ablate']), default='edm', show_default=True)
 @click.option('--val_label',     help='Label mode', metavar='auto|uniform|dataset|fixed:K',         type=str, default='auto', show_default=True)
 @click.option('--val_dump_images_dir', help='Optional: dump validation images', metavar='DIR',       type=str)
-@click.option('--val_dump_full_stats', help='Include full mu/sigma in val_{kimg}.json (large files)', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--val_overwrite', help='Overwrite existing val_{kimg}.json', metavar='BOOL',          type=bool, default=False, show_default=True)
 @click.option('--val_at_start',  help='Run validation at start (tick 0)', metavar='BOOL',            type=bool, default=False, show_default=True)
 @click.option('--val_teacher',   help='Run one-time teacher baseline validation at start', metavar='BOOL', type=bool, default=True, show_default=True)
@@ -151,8 +148,7 @@ def main(**kwargs):
     # Initialize config dict.
     c = dnnlib.EasyDict()
     c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2,
-                                           persistent_workers=(opts.workers > 0))
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
@@ -241,7 +237,6 @@ def main(**kwargs):
             sampling_mode=opts.sampling_mode,
             terminal_anchor=opts.terminal_anchor,
             terminal_teacher_hop=opts.terminal_teacher_hop,
-            enable_stats=opts.cd_enable_stats,
         )
         # Provenance and optional eval knob (stored only).
         c.teacher = opts.teacher
@@ -273,7 +268,7 @@ def main(**kwargs):
     c.ema_rampup_ratio = opts.ema_rampup if opts.ema_rampup > 0 else None
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
-    c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump, step_metrics_every=opts.step_metrics_every)
+    c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
 
     # Random seed.
     if opts.seed is not None:
@@ -428,7 +423,6 @@ def main(**kwargs):
         ref=opts.val_ref,
         ref_data=opts.val_ref_data,
         dump_images_dir=opts.val_dump_images_dir,
-        dump_full_stats=opts.val_dump_full_stats,
         overwrite=opts.val_overwrite,
         at_start=opts.val_at_start,
         teacher=opts.val_teacher,
