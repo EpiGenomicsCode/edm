@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=00:30:00
+#SBATCH --time=02:00:00
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
 
@@ -66,7 +66,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --rho=7 --sigma_min=0.002 --sigma_max=80 \
   --cd_loss=pseudo_huber --cd_weight_mode=sqrt_karras \
   --wandb=True --wandb_project=edm-cd --wandb_entity=vinaysmathew-penn-state \
-  --wandb_run=imagenet64-cd-s8-live-AdamW-noClip --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
+  --wandb_run=imagenet64-cd-s8-live-AdamW-Clip0 --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
   --val=1 \
   --val_teacher=False \
   --snap=20 \
