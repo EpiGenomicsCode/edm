@@ -56,6 +56,7 @@ def training_loop(
     validation_kwargs   = None,     # Validation configuration (PRD-04).
     cd_target_mode      = 'live',   # Target network mode for CD sigma_s denoiser: 'live' | 'ema' | 'teacher'.
     cd_target_ema       = 0.95,     # EMA rate for target network (only used if cd_target_mode='ema').
+    grad_clip           = 1.0,      # maximum gradient norm (0 = disable)
 ):
     # Initialize.
     start_time = time.time()
@@ -398,6 +399,11 @@ def training_loop(
         training_stats.report('Grad/global_norm', grad_global_norm)
         training_stats.report('Grad/param_norm', param_global_norm)
         training_stats.report('Grad/update_over_param', true_update_over_param)
+
+        # Clip gradients if requested.
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+
         optimizer.step()
         # Per-optimizer-step diagnostics (rank 0 only, written to step_stats.jsonl and W&B).
         if dist.get_rank() == 0:
