@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
 
@@ -77,4 +77,5 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --val_every=20 \
   --val_at_start=0 \
   --dropout=0.0 \
+  --resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00002-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/network-snapshot-002050.pkl
     # --cd_target_ema=0.95 
