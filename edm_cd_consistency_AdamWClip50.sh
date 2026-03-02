@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
 
@@ -52,10 +52,10 @@ export LOCAL_RANK=0
 
 # Run training with torchrun and arguments per prompt
 torchrun --standalone --nproc_per_node=4 train.py \
-  --outdir=/work/nvme/bbse/xyou1/training-runs/imagenet64-cd-s8/AdamClip0 \  
+  --outdir=/work/nvme/bbse/xyou1/training-runs/imagenet64-cd-s8/AdamWClip50 \
   --data=/work/nvme/bbse/vmathew/edm_training/edm/datasets/imagenet-64x64.zip \
   --cond=1 --arch=adm --precond=edm \
-  --batch=2048 --batch-gpu=64 --fp16=True --ema=50 --lr=8e-5 --ema_rampup=0.05 --grad-clip=0.0 \
+  --batch=2048 --batch-gpu=64 --fp16=True --ema=50 --lr=8e-5 --ema_rampup=0.05 --grad-clip=50.0 \
   --consistency=True \
   --sampling_mode=edm \
   --duration=410 \
@@ -66,7 +66,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --rho=7 --sigma_min=0.002 --sigma_max=80 \
   --cd_loss=pseudo_huber --cd_weight_mode=sqrt_karras \
   --wandb=True --wandb_project=edm-cd --wandb_entity=vinaysmathew-penn-state \
-  --wandb_run=imagenet64-cd-s8-live-Adam-Clip0 --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
+  --wandb_run=imagenet64-cd-s8-live-AdamW-Clip50 --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
   --val=1 \
   --val_teacher=False \
   --snap=20 \
@@ -78,5 +78,5 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --val_at_start=0 \
   --dropout=0.0 \
   --seed=1959836853 \
-  --resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00000-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-002050.pt      
-  #--cd_target_ema=0.95
+  --resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00003-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-002050.pt      
+  # --cd_target_ema=0.95

@@ -258,7 +258,7 @@ def compute_importance_weights(
     # a fixed-probability anchor to clean data.  IS governs only the T-1
     # non-terminal edges, which share the remaining (1 - 1/T) probability.
     if terminal_anchor and T > 1 and mode != "uniform":
-        target_p = 1.0 / 40
+        target_p = 1.0 / T  # Matching MSCD's uniform anchor rate
         non_term = weights[:-1]
         non_term_sum = non_term.sum().clamp(min=1e-10)
         weights[:-1] = non_term * (1.0 - target_p) / non_term_sum
