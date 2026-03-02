@@ -78,5 +78,5 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --val_at_start=0 \
   --dropout=0.0 \
   --seed=1959836853 \
-  --resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00003-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-002050.pt      
-  # --cd_target_ema=0.95
+  #--resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00003-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-002050.pt      
+  #--cd_target_ema=0.95
