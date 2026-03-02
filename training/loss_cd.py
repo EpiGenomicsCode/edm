@@ -174,7 +174,7 @@ class EDMConsistencyDistillLoss:
         self._count_general_edges = 0       # total general interior edges sampled (per-sample)
         self._count_total_calls = 0         # total __call__ invocations (unchanged semantics)
         self._count_total_edges = 0         # NEW: total sampled edges across all calls (≈ batch_size × calls)
-        self._filter_cache = {}             # {T_edges_int: (teacher_sigmas, terminal_k)}
+        self._filter_cache = {}             # {target_T: (filtered_teacher_sigmas, terminal_k)}
 
     def set_run_dir(self, run_dir: str) -> None:
         """Set the training run directory for debug logging."""
@@ -273,20 +273,48 @@ class EDMConsistencyDistillLoss:
         sigmas = torch.cat([sigmas_prepad, zero], dim=0)
         return sigmas
 
-    def _build_teacher_grid(self, device: torch.device) -> torch.Tensor:
-        # Teacher grid: T positive sigmas + terminal 0
-        T_edges = self._current_T_edges()
-        sigmas_prepad = make_karras_sigmas(
-            num_nodes=T_edges,
-            sigma_min=self.sigma_min,
-            sigma_max=self.sigma_max,
-            rho=self.rho,
-            round_fn=self.teacher_net.round_sigma,
-        ).to(device)
-        # Append terminal zero
-        zero = torch.zeros(1, device=device, dtype=sigmas_prepad.dtype)
-        sigmas = torch.cat([sigmas_prepad, zero], dim=0)
-        return sigmas
+    def _build_teacher_grid(self, student_sigmas: torch.Tensor, device: torch.device):
+        """Build filtered teacher grid with at least _current_T_edges() effective edges.
+
+        Teacher edges whose sigma matches a student interior sigma are removed
+        (prevents sigma_t == segment upper boundary).  To ensure the effective
+        edge count never drops below the target from the annealing schedule, the
+        raw grid size is inflated until the post-filter count >= target.
+
+        Returns:
+            teacher_sigmas: 1D tensor [T_eff+1] (descending, terminal 0)
+            terminal_k: index of the terminal edge in the filtered grid
+        """
+        target_T = self._current_T_edges()
+
+        # Check cache: avoid recomputing for the same target_T.
+        if target_T in self._filter_cache:
+            cached_sigmas, cached_terminal_k = self._filter_cache[target_T]
+            return cached_sigmas.to(device), cached_terminal_k
+
+        raw_T = target_T
+        while True:
+            sigmas_prepad = make_karras_sigmas(
+                num_nodes=raw_T,
+                sigma_min=self.sigma_min,
+                sigma_max=self.sigma_max,
+                rho=self.rho,
+                round_fn=self.teacher_net.round_sigma,
+            ).to(device)
+            zero = torch.zeros(1, device=device, dtype=sigmas_prepad.dtype)
+            teacher_full = torch.cat([sigmas_prepad, zero], dim=0)
+
+            teacher_filtered, terminal_k = filter_teacher_edges_by_sigma(
+                student_sigmas=student_sigmas,
+                teacher_sigmas=teacher_full,
+            )
+            T_eff = teacher_filtered.shape[0] - 1
+            if T_eff >= target_T:
+                break
+            raw_T += 1
+
+        self._filter_cache[target_T] = (teacher_filtered.clone(), terminal_k)
+        return teacher_filtered.to(device), terminal_k
 
     def _weight(self, sigma: torch.Tensor) -> torch.Tensor:
         """
@@ -353,20 +381,12 @@ class EDMConsistencyDistillLoss:
         # Build grids with terminal zeros.
         student_sigmas = self._build_student_grid(net=net, device=device)  # [S+1] with terminal 0
 
-        # Full teacher grid from Karras schedule
-        teacher_sigmas_full = self._build_teacher_grid(device=device)      # [T+1] with terminal 0
-
-        T_edges_int = self._current_T_edges()
-        if T_edges_int in self._filter_cache:
-            teacher_sigmas, terminal_k = self._filter_cache[T_edges_int]
-            teacher_sigmas = teacher_sigmas.to(device)
-        else:
-            teacher_sigmas, terminal_k = filter_teacher_edges_by_sigma(
-                student_sigmas=student_sigmas,
-                teacher_sigmas=teacher_sigmas_full,
-            )
-            self._filter_cache[T_edges_int] = (teacher_sigmas.clone(), terminal_k)
-
+        # Teacher grid: filtered to remove edges where sigma_t == student boundary.
+        # Raw grid is inflated so effective edge count >= target from annealing schedule,
+        # preventing the non-monotonic T_edges oscillation that plagued the old approach.
+        teacher_sigmas, terminal_k = self._build_teacher_grid(
+            student_sigmas=student_sigmas, device=device,
+        )
         T_edges = teacher_sigmas.shape[0] - 1
 
         sigma_bounds = partition_edges_by_sigma(
@@ -428,18 +448,38 @@ class EDMConsistencyDistillLoss:
         sigma_s = sigma_s_eff.to(y.dtype).view(batch_size, 1, 1, 1)
         sigma_bdry = sigma_bdry_vec.to(y.dtype).view(batch_size, 1, 1, 1)
 
-        # Optional runtime invariant checks (PRD §5, R7)
+        # Ground-truth ordering invariants (always asserted).
+        tol = 1e-8
+        # sigma_t must be strictly below the segment's upper boundary, except for
+        # two structural endpoints: (a) segment 0 where sigma_t = sigma_max is
+        # unavoidable since both grids start there, and (b) the terminal edge.
+        sigma_upper_vec = student_sigmas[j]
+        interior_mask = (j > 0) & (~is_terminal)
+        if interior_mask.any():
+            assert (sigma_t_vec[interior_mask] < sigma_upper_vec[interior_mask] - tol).all(), (
+                "Ordering: sigma_t must be strictly < segment upper boundary (interior segments)"
+            )
+        assert (sigma_t_vec > sigma_s_teacher_vec + tol).all(), (
+            "Ordering: sigma_t must be strictly > sigma_s (raw)"
+        )
+        non_term = ~is_terminal
+        if non_term.any():
+            assert (sigma_t_vec[non_term] > sigma_s_eff[non_term] + tol).all(), (
+                "Ordering: sigma_t must be strictly > sigma_s_eff for non-terminal"
+            )
+        assert (sigma_s_eff >= sigma_bdry_vec - tol).all(), (
+            "Ordering: sigma_s_eff must be >= sigma_bdry"
+        )
+
+        # Optional extra invariant checks (PRD §5, R7) when debug_invariants enabled.
         if self.debug_invariants:
-            # Ordering invariants
-            assert (sigma_t_vec >= sigma_s_eff - 1e-8).all(), "Ordering: sigma_t >= sigma_s_eff violated"
-            assert (sigma_s_eff >= sigma_bdry_vec - 1e-8).all(), "Ordering: sigma_s_eff >= sigma_bdry violated"
             assert (sigma_s_eff[is_terminal] == 0).all(), "Terminal edges must have sigma_s_eff == 0"
-            
-            # Edge-type mask disjointness
             assert (is_terminal & is_boundary_snap).sum() == 0, "Terminal and boundary_snap must be disjoint"
-            
-            # Sampler-specific invariants
             assert (n_rel[is_boundary_snap] == 1).all(), "Boundary snap edges must have n_rel == 1"
+            if is_boundary_snap.any():
+                assert (sigma_t_vec[is_boundary_snap] > sigma_bdry_vec[is_boundary_snap] + tol).all(), (
+                    "Boundary snap: sigma_t must be strictly > sigma_bdry"
+                )
 
         # Sample noise and form x_t = y + sigma_t * eps (PRD §4.2.4)
         eps = torch.randn_like(y)
