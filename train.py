@@ -39,6 +39,19 @@ def parse_int_list(s):
     return ranges
 
 #----------------------------------------------------------------------------
+# Parse a comma-separated list of floats. Empty/none => None.
+
+def parse_float_list(s):
+    if s is None:
+        return None
+    if isinstance(s, list):
+        return [float(x) for x in s]
+    s = str(s).strip()
+    if s == '' or s.lower() in ('none', 'null', 'off', '0'):
+        return None
+    return [float(x.strip()) for x in s.split(',') if x.strip() != '']
+
+#----------------------------------------------------------------------------
 
 @click.command()
 
@@ -84,6 +97,7 @@ def parse_int_list(s):
 @click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=2e-6, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
 @click.option('--ema_rampup',    help='EMA rampup ratio (0=disable rampup, Song uses 0)', metavar='FLOAT', type=click.FloatRange(min=0), default=0.05, show_default=True)
+@click.option('--phema',         help='Enable power-function EMA snapshots (comma stds, e.g. 0.05,0.10; empty disables)', metavar='LIST', type=str, default='', show_default=True)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
@@ -152,6 +166,9 @@ def main(**kwargs):
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
+
+    # Optional: power-function EMA (EDM2 post-hoc EMA) snapshotting.
+    c.phema_stds = parse_float_list(opts.phema)
 
     # Validate dataset options.
     try:

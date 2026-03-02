@@ -42,6 +42,7 @@ def training_loop(
     total_kimg          = 200000,   # Training duration, measured in thousands of training images.
     ema_halflife_kimg   = 500,      # Half-life of the exponential moving average (EMA) of model weights.
     ema_rampup_ratio    = 0.05,     # EMA ramp-up coefficient, None = no rampup.
+    phema_stds          = None,     # Optional: list/tuple of power-EMA stds (e.g., [0.05, 0.10]) to snapshot for post-hoc EMA.
     lr_rampup_kimg      = 10000,    # Learning rate ramp-up duration.
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     kimg_per_tick       = 50,       # Interval of progress prints.
@@ -131,6 +132,18 @@ def training_loop(
         find_unused_parameters=ddp_find_unused_parameters,
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
+
+    # Optional power-function EMA (EDM2 post-hoc EMA) for snapshotting.
+    phema = None
+    if phema_stds is not None:
+        try:
+            from training.phema import PowerFunctionEMA
+            phema = PowerFunctionEMA(net=net, stds=tuple(phema_stds))
+            phema.reset()
+            dist.print0(f'[PHEMA] Enabled power-function EMA stds={list(phema_stds)}')
+        except Exception as _e:
+            dist.print0(f'[PHEMA] Failed to initialize PowerFunctionEMA: {_e}')
+            phema = None
     
     # Initialize target network for CD sigma_s denoiser (OpenAI CM style).
     # This is separate from the validation EMA and is used during training.
@@ -242,6 +255,23 @@ def training_loop(
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
+        # Restore validation EMA if present; otherwise keep it synced to net.
+        if 'ema' in data:
+            try:
+                misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=True)
+                dist.print0('[EMA] Loaded validation EMA from training state.')
+            except Exception as _e:
+                dist.print0(f'[EMA] Failed to load validation EMA from training state: {_e}')
+                misc.copy_params_and_buffers(src_module=net, dst_module=ema, require_all=False)
+        else:
+            misc.copy_params_and_buffers(src_module=net, dst_module=ema, require_all=False)
+        # Restore power-function EMA tracker if present and enabled.
+        if phema is not None and 'phema' in data:
+            try:
+                phema.load_state_dict(data['phema'])
+                dist.print0('[PHEMA] Loaded power-function EMA state from training state.')
+            except Exception as _e:
+                dist.print0(f'[PHEMA] Failed to load PHEMA state from training state: {_e}')
         # Load target_ema if it was saved and we're using it.
         if target_ema_net is not None and 'target_ema' in data:
             misc.copy_params_and_buffers(src_module=data['target_ema'], dst_module=target_ema_net, require_all=True)
@@ -511,6 +541,7 @@ def training_loop(
         cur_step += 1
 
         # Update EMA (validation/snapshot EMA).
+        # NOTE: This uses cur_nimg (pre-increment) to preserve existing behavior.
         ema_halflife_nimg = ema_halflife_kimg * 1000
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
@@ -518,6 +549,13 @@ def training_loop(
         for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
         ema_updates += 1
+
+        # Update power-function EMA (post-hoc EMA basis profiles), using t_next=cur_nimg+batch_size.
+        if phema is not None:
+            try:
+                phema.update(cur_nimg=(cur_nimg + batch_size), batch_size=batch_size)
+            except Exception as _e:
+                dist.print0(f'[PHEMA] update failed: {_e}')
         
         # Update target EMA (for CD sigma_s denoiser, OpenAI CM style).
         # This uses a fixed EMA rate (no rampup), matching OpenAI's "fixed" mode.
@@ -680,6 +718,47 @@ def training_loop(
                 print(f'[RANK {dist.get_rank()}] snapshot: done', flush=True)
             del data  # conserve memory
 
+        # Save power-function EMA snapshots (one pickle per std) for post-hoc reconstruction.
+        # These are compatible with `edm2/reconstruct_phema.py`, which expects filenames:
+        #   <prefix>-<kimg>-<std>.pkl
+        if phema is not None and (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
+            # Prepare rank-0-only CPU copies for each EMA profile.
+            phema_list = []
+            try:
+                phema_list = phema.get()  # [(net, suffix)]
+            except Exception as _e:
+                dist.print0(f'[PHEMA] get() failed: {_e}')
+                phema_list = []
+
+            # Deepcopy + CPU-move the shared non-EMA parts once to reduce overhead.
+            base = dict(loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            if target_ema_net is not None:
+                base['target_ema'] = target_ema_net
+            base_cpu = dict(base)
+            for key, value in base.items():
+                if isinstance(value, torch.nn.Module):
+                    v = copy.deepcopy(value).eval().requires_grad_(False)
+                    try:
+                        misc.check_ddp_consistency(v)
+                    except Exception:
+                        pass
+                    base_cpu[key] = v.cpu()
+                del value
+
+            # Emit one pickle per std profile.
+            for ema_net, ema_suffix in phema_list:
+                data_phema = dict(base_cpu, ema=copy.deepcopy(ema_net).eval().requires_grad_(False).cpu())
+                if dist.get_rank() == 0:
+                    std_str = ema_suffix.lstrip('-')  # "0.050"
+                    fname = f'network-snapshot-{cur_nimg//1000:06d}-{std_str}.pkl'
+                    with open(os.path.join(run_dir, fname), 'wb') as f:
+                        pickle.dump(data_phema, f)
+                del data_phema
+
+            # Ensure ranks stay in sync w.r.t. disk I/O.
+            torch.distributed.barrier()
+            del base_cpu, base, phema_list
+
         # Save full dump of the training state (after validation and snapshot).
         # NOTE: Only rank 0 writes the file, but ALL ranks must wait before starting the
         # next iteration to avoid some ranks entering the next backward() while rank 0
@@ -689,10 +768,16 @@ def training_loop(
         if need_state_dump and dist.get_rank() == 0:
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] state_dump: starting', flush=True)
-            state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
+            state_dict = dict(net=net, optimizer_state=optimizer.state_dict(), ema=ema)
             # Also save target_ema state if it exists.
             if target_ema_net is not None:
                 state_dict['target_ema'] = target_ema_net
+            # Also save power-function EMA tracker state (if enabled).
+            if phema is not None:
+                try:
+                    state_dict['phema'] = phema.state_dict()
+                except Exception as _e:
+                    dist.print0(f'[PHEMA] Failed to serialize state_dict: {_e}')
             torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] state_dump: done', flush=True)
