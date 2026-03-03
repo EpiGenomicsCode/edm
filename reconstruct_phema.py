@@ -23,8 +23,48 @@ import numpy as np
 import torch
 import dnnlib
 import training.phema
+from torch_utils import persistence, misc
 
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
+
+#----------------------------------------------------------------------------
+# Persistence import hook to make training snapshots robust to relative imports.
+# Mirrors the logic used in generate.py so that checkpoints that include
+# training.loss_cd and torch_utils.* can be loaded without
+# `attempted relative import with no known parent package` errors.
+
+@persistence.import_hook
+def _fix_relative_imports(meta: dnnlib.EasyDict) -> dnnlib.EasyDict:
+    src = meta.module_src
+
+    # training.loss_cd: relative import -> absolute
+    src = src.replace(
+        "from .consistency_ops import (",
+        "from training.consistency_ops import (",
+    )
+
+    # torch_utils.*: relative imports -> absolute
+    src = src.replace(
+        "from . import distributed as dist",
+        "from torch_utils import distributed as dist",
+    )
+    src = src.replace(
+        "from . import training_stats",
+        "from torch_utils import training_stats",
+    )
+    src = src.replace(
+        "from . import misc",
+        "from torch_utils import misc",
+    )
+
+    # dnnlib.__init__: relative import -> absolute
+    src = src.replace(
+        "from .util import EasyDict, make_cache_dir_path",
+        "from dnnlib.util import EasyDict, make_cache_dir_path",
+    )
+
+    meta.module_src = src
+    return meta
 
 #----------------------------------------------------------------------------
 # Construct the full path of a network pickle.
