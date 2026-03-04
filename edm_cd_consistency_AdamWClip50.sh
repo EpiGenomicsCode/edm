@@ -52,7 +52,7 @@ export LOCAL_RANK=0
 
 # Run training with torchrun and arguments per prompt
 torchrun --standalone --nproc_per_node=4 train.py \
-  --outdir=/work/nvme/bbse/xyou1/training-runs/imagenet64-cd-s8/AdamWClip50 \
+  --outdir=/u/xyou1/edm/training-runs/imagenet64-cd-s8/AdamWClip50 \
   --data=/work/nvme/bbse/vmathew/edm_training/edm/datasets/imagenet-64x64.zip \
   --cond=1 --arch=adm --precond=edm \
   --batch=2048 --batch-gpu=64 --fp16=True --ema=50 --lr=8e-5 --ema_rampup=0.05 --grad-clip=50.0 \
