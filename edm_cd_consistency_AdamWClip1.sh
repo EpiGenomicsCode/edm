@@ -11,6 +11,10 @@
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
 
+unset NCCL_NET || true
+unset FI_PROVIDER || true
+unset NCCL_SOCKET_IFNAME || true
+
 set -euo pipefail
 
 # Ensure log directory exists

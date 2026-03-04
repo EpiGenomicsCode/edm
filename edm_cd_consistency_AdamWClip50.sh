@@ -7,9 +7,13 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/u/xyou1/edm/slurm_logs/%x-%j.out
 #SBATCH --error=/u/xyou1/edm/slurm_logs/%x-%j.err
+
+unset NCCL_NET || true
+unset FI_PROVIDER || true
+unset NCCL_SOCKET_IFNAME || true
 
 set -euo pipefail
 
