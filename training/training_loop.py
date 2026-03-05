@@ -50,6 +50,7 @@ def training_loop(
     resume_pkl          = None,     # Start from the given network snapshot, None = random initialization.
     resume_state_dump   = None,     # Start from the given training state, None = reset training state.
     resume_kimg         = 0,        # Start from the given training progress.
+    step_metrics_every  = 0,        # Emit per-step JSONL/W&B metrics every N steps (0 = disable).
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
     validation_kwargs   = None,     # Validation configuration (PRD-04).
@@ -99,36 +100,29 @@ def training_loop(
         dist.print0(f'[EMA CONFIG]   Rampup active → effective halflife = min({ema_halflife_kimg} kimg, {ema_rampup_ratio}*cur_nimg)')
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
+    loss_fn._collect_step_metrics = False
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    # DDP configuration:
-    # - Disable broadcast_buffers since we only use GroupNorm (no running stats).
-    # - Disable gradient_as_bucket_view to avoid rare reducer bucket bugs
-    #   observed with this PyTorch/NCCL combination (negative-dimension tensors
-    #   when rebuilding buckets).
-    # - Keep static_graph=False because enabling it with this CD graph +
-    #   PyTorch build has been observed to trigger internal
-    #   expect_autograd_hooks_ assertions in the reducer.
-    # - Enable find_unused_parameters=True as a conservative setting so that
-    #   the reducer tolerates any parameters that might not participate in the
-    #   backward graph on a given iteration (even though we expect the graph to
-    #   be effectively fixed in practice).
-    #
-    # NOTE: You can override this for performance once you've verified there
-    # are no unused parameters:
-    #   export EDM_DDP_FIND_UNUSED_PARAMETERS=0
+    # DDP configuration — tuned for multi-node CD training:
+    # - broadcast_buffers=False: only GroupNorm (no running stats)
+    # - gradient_as_bucket_view=True: avoids extra gradient copies during allreduce
+    # - find_unused_parameters=False: all params used every iteration
+    # - bucket_cap_mb=100: larger buckets → fewer allreduce calls over cross-node fabric
     _find_unused_env = os.environ.get('EDM_DDP_FIND_UNUSED_PARAMETERS', '').strip().lower()
-    ddp_find_unused_parameters = True
+    ddp_find_unused_parameters = False
     if _find_unused_env != '':
         ddp_find_unused_parameters = _find_unused_env not in ('0', 'false', 'no', 'off')
-    dist.print0(f'[DDP CONFIG] find_unused_parameters={ddp_find_unused_parameters} (EDM_DDP_FIND_UNUSED_PARAMETERS={_find_unused_env or "<unset>"})')
+    _bucket_cap_mb = int(os.environ.get('EDM_DDP_BUCKET_CAP_MB', '100'))
+    dist.print0(f'[DDP CONFIG] find_unused_parameters={ddp_find_unused_parameters} '
+                f'gradient_as_bucket_view=True bucket_cap_mb={_bucket_cap_mb}')
     ddp = torch.nn.parallel.DistributedDataParallel(
         net,
         device_ids=[device],
         broadcast_buffers=False,
-        gradient_as_bucket_view=False,
+        gradient_as_bucket_view=True,
         static_graph=False,
         find_unused_parameters=ddp_find_unused_parameters,
+        bucket_cap_mb=_bucket_cap_mb,
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
@@ -335,6 +329,7 @@ def training_loop(
     cur_step = 0
     ema_updates = 0
     last_loss_scalar = None
+    step_metrics_every = max(int(step_metrics_every or 0), 0)
     while True:
         if os.environ.get('CD_DDP_DEBUG'):
             print(f'[RANK {dist.get_rank()}] loop iter start: cur_nimg={cur_nimg}', flush=True)
@@ -347,6 +342,10 @@ def training_loop(
             pass
 
         # Accumulate gradients.
+        # Tell loss_fn whether to build _last_step_metrics this step.
+        _will_collect = step_metrics_every > 0 and (cur_step % step_metrics_every == 0)
+        if hasattr(loss_fn, '_collect_step_metrics'):
+            loss_fn._collect_step_metrics = _will_collect
         if os.environ.get('CD_DDP_DEBUG'):
             print(f'[RANK {dist.get_rank()}] zero_grad', flush=True)
         optimizer.zero_grad(set_to_none=True)
@@ -357,8 +356,8 @@ def training_loop(
                 images, labels = next(dataset_iterator)
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: batch fetched, moving to device', flush=True)
-                images = images.to(device).to(torch.float32) / 127.5 - 1
-                labels = labels.to(device)
+                images = images.to(device, non_blocking=True).to(torch.float32) / 127.5 - 1
+                labels = labels.to(device, non_blocking=True)
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: calling loss_fn', flush=True)
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
@@ -368,38 +367,41 @@ def training_loop(
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
                 if os.environ.get('CD_DDP_DEBUG'):
                     print(f'[RANK {dist.get_rank()}] round {round_idx}: backward done', flush=True)
-                try:
-                    last_loss_scalar = float(loss.mean().detach().cpu().item())
-                except Exception:
-                    pass
+
+        last_loss_scalar = float(loss.mean().detach().cpu().item())
 
         # Update weights.
+        collect_step_metrics = step_metrics_every > 0 and (cur_step % step_metrics_every == 0)
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
-        # Capture the effective LR for this step (assume a single scalar LR across params).
         current_lr = optimizer.param_groups[0]['lr']
-
-        # Sanitize gradients and compute global norms (per optimizer step).
-        total_grad_sq = torch.zeros([], device=device)
-        total_param_sq = torch.zeros([], device=device)
-        for param in net.parameters():
-            # Accumulate parameter norm regardless of gradient presence.
-            param_norm = param.detach().float().norm(2)
-            total_param_sq = total_param_sq + param_norm * param_norm
-            if param.grad is not None:
-                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-                grad_norm = param.grad.detach().float().norm(2)
-                total_grad_sq = total_grad_sq + grad_norm * grad_norm
-        grad_global_norm = torch.sqrt(total_grad_sq)
-        param_global_norm = torch.sqrt(total_param_sq)
-        # True update/param ratio, incorporating the current learning rate.
-        true_update_over_param = (current_lr * grad_global_norm) / torch.clamp(param_global_norm, min=1e-12)
-        training_stats.report('Grad/global_norm', grad_global_norm)
-        training_stats.report('Grad/param_norm', param_global_norm)
-        training_stats.report('Grad/update_over_param', true_update_over_param)
+        grad_global_norm = None
+        param_global_norm = None
+        true_update_over_param = None
+        # Sanitize gradients always; only compute expensive global norms when step metrics are enabled.
+        if collect_step_metrics:
+            total_grad_sq = torch.zeros([], device=device)
+            total_param_sq = torch.zeros([], device=device)
+            for param in net.parameters():
+                param_norm = param.detach().float().norm(2)
+                total_param_sq = total_param_sq + param_norm * param_norm
+                if param.grad is not None:
+                    torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+                    grad_norm = param.grad.detach().float().norm(2)
+                    total_grad_sq = total_grad_sq + grad_norm * grad_norm
+            grad_global_norm = torch.sqrt(total_grad_sq)
+            param_global_norm = torch.sqrt(total_param_sq)
+            true_update_over_param = (current_lr * grad_global_norm) / torch.clamp(param_global_norm, min=1e-12)
+            training_stats.report('Grad/global_norm', grad_global_norm)
+            training_stats.report('Grad/param_norm', param_global_norm)
+            training_stats.report('Grad/update_over_param', true_update_over_param)
+        else:
+            for param in net.parameters():
+                if param.grad is not None:
+                    torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
         # Per-optimizer-step diagnostics (rank 0 only, written to step_stats.jsonl and W&B).
-        if dist.get_rank() == 0:
+        if collect_step_metrics and dist.get_rank() == 0:
             if step_stats_jsonl is None and run_dir is not None:
                 step_stats_path = os.path.join(run_dir, 'step_stats.jsonl')
                 step_stats_jsonl = open(step_stats_path, 'at')
@@ -416,9 +418,9 @@ def training_loop(
                 'tick': int(cur_tick),
                 'ema_beta': float(_ema_beta_log),
                 'lr': float(current_lr),
-                'grad_global_norm': float(grad_global_norm.detach().cpu()),
-                'param_global_norm': float(param_global_norm.detach().cpu()),
-                'update_over_param': float(true_update_over_param.detach().cpu()),
+                'grad_global_norm': float(grad_global_norm.detach().cpu()) if grad_global_norm is not None else None,
+                'param_global_norm': float(param_global_norm.detach().cpu()) if param_global_norm is not None else None,
+                'update_over_param': float(true_update_over_param.detach().cpu()) if true_update_over_param is not None else None,
                 'loss': float(last_loss_scalar) if last_loss_scalar is not None else None,
             }
             if hasattr(loss_fn, '_last_step_metrics') and isinstance(getattr(loss_fn, '_last_step_metrics'), dict):
@@ -434,11 +436,14 @@ def training_loop(
                     wandb_payload = {
                         'opt_step': step_record['step'],
                         'kimg': step_record['kimg'],
-                        'Grad/global_norm': step_record['grad_global_norm'],
-                        'Grad/param_norm': step_record['param_global_norm'],
-                        'Grad/update_over_param': step_record['update_over_param'],
                         'EMA/val_ema_beta': step_record['ema_beta'],
                     }
+                    if step_record['grad_global_norm'] is not None:
+                        wandb_payload['Grad/global_norm'] = step_record['grad_global_norm']
+                    if step_record['param_global_norm'] is not None:
+                        wandb_payload['Grad/param_norm'] = step_record['param_global_norm']
+                    if step_record['update_over_param'] is not None:
+                        wandb_payload['Grad/update_over_param'] = step_record['update_over_param']
                     # Per-step loss (separate from tick-level summary loss).
                     if step_record['loss'] is not None:
                         wandb_payload['Loss/loss_step'] = step_record['loss']
