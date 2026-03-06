@@ -84,6 +84,9 @@ def training_loop(
     interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
+    if hasattr(net, 'use_fp16') and not net.use_fp16:
+        dist.print0('[OVERRIDE] Forcing use_fp16=True on student network')
+        net.use_fp16 = True
     if dist.get_rank() == 0:
         with torch.no_grad():
             images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
@@ -133,6 +136,11 @@ def training_loop(
         target_ema_net = copy.deepcopy(net).eval().requires_grad_(False)
         dist.print0(f'[CD TARGET] Initialized target EMA network with rate={cd_target_ema}')
     
+    # Force fp16 on teacher network (matches student override above).
+    if hasattr(loss_fn, 'teacher_net') and hasattr(loss_fn.teacher_net, 'use_fp16') and not loss_fn.teacher_net.use_fp16:
+        dist.print0('[OVERRIDE] Forcing use_fp16=True on teacher network')
+        loss_fn.teacher_net.use_fp16 = True
+
     # Seed student from teacher AFTER DDP wrapping (if CD mode and shapes match).
     # This avoids NCCL desync issues during DDP initialization.
     if hasattr(loss_fn, 'teacher_net'):
