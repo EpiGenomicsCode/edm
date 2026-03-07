@@ -1,4 +1,30 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.defaultProfile.linux": "bash",
+    "terminal.integrated.env.linux": {
+        "PATH": "/u/xyou1/.conda/envs/edm2/bin:${env:PATH}"
+    },
+
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/node_modules/*/**": true,
+        "**/.hg/store/**": true,
+        "**/slurm_logs/**": true,
+        "**/training-runs/**": true,
+        "**/datasets/**": true
+    },
+
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/CVS": true,
+        "**/.DS_Store": true,
+        "**/Thumbs.db": true,
+        "**/__pycache__": true
+    }
 }
