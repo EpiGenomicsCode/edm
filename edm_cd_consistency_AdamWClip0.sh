@@ -60,9 +60,22 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export EDM_DDP_FIND_UNUSED_PARAMETERS=0
 
+# 1. The Python C-Crash Catcher
+export PYTHONFAULTHANDLER=1
+
+# 2. The PyTorch C++ X-Ray
+export TORCH_SHOW_CPP_STACKTRACES=1
+
+# 3. The NCCL Network Wiretap
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=ALL
+
+# (Optional) 4. Force Synchronous Execution
+export CUDA_LAUNCH_BLOCKING=1
+
 # Run training with torchrun and arguments per prompt
 torchrun --standalone --nproc_per_node=4 train.py \
-  --outdir=/work/hdd/bbse/xyou1/edm-training-runs/imagenet64-cd-s8/AdamWClip0 \
+  --outdir=/work/hdd/bbse/xyou1/edm-training-runs/imagenet64-cd-s8/AdamWClip0_Dropout_01 \
   --data=/work/nvme/bbse/vmathew/edm_training/edm/datasets/imagenet-64x64.zip \
   --cond=1 --arch=adm --precond=edm \
   --batch=2048 --batch-gpu=64 --fp16=True --ema=50 --lr=8e-5 --ema_rampup=0.05 --grad-clip=0.0 \
@@ -76,7 +89,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --rho=7 --sigma_min=0.002 --sigma_max=80 \
   --cd_loss=pseudo_huber --cd_weight_mode=sqrt_karras \
   --wandb=True --wandb_project=edm-cd --wandb_entity=vinaysmathew-penn-state \
-  --wandb_run=imagenet64-cd-s8-live-AdamW-Clip0 --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
+  --wandb_run=imagenet64-cd-s8-live-AdamW-Clip0-Dropout-01 --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
   --val=1 \
   --val_teacher=False \
   --snap=20 \
@@ -86,7 +99,8 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --val_steps=8 \
   --val_every=20 \
   --val_at_start=0 \
-  --dropout=0.0 \
+  --dropout=0.1 \
   --seed=1959836853 \
   --workers=4 \
-  --resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/AdamWClip0/00001-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-013316.pt \
+  # --resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00002-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-002050.pt \
+  # --cd_target_ema=0.95

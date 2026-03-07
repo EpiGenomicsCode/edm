@@ -138,7 +138,7 @@ def training_loop(
     # This is separate from the validation EMA and is used during training.
     target_ema_net = None
     if hasattr(loss_fn, 'teacher_net') and cd_target_mode == 'ema':
-        target_ema_net = copy.deepcopy(net).eval().requires_grad_(False)
+        target_ema_net = copy.deepcopy(net).train().requires_grad_(False)
         dist.print0(f'[CD TARGET] Initialized target EMA network with rate={cd_target_ema}')
     
     # Seed student from teacher AFTER DDP wrapping (if CD mode and shapes match).

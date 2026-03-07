@@ -7,6 +7,8 @@ import torch
 from torch_utils import persistence
 from torch_utils import training_stats
 
+# from torch_utils import distributed as dist # Add for logging dropout mask
+
 from .consistency_ops import (
     make_karras_sigmas,
     partition_edges_by_sigma,
@@ -540,32 +542,54 @@ class EDMConsistencyDistillLoss:
         if general_mask.any():
             idx_g = general_mask
             with torch.no_grad():
+                # 1. Capture the GPU's exact RNG state before hitting ANY target layers
+                rng_state = torch.cuda.get_rng_state(device)
+                
+                # --- Dropout Mask Capture for Debugging ---
+                # dropout_masks_t = []
+                # def save_mask_hook(module, inputs, output):
+                            # 'inputs' is a tuple of what went INTO conv1. 
+                            # inputs[0] is the tensor that just came out of functional.dropout
+                #            dropped_tensor = inputs[0]
+                #            mask = (dropped_tensor == 0).byte()
+                #            dropout_masks_t.append(mask)
+                #hooks = []
+                
                 if self.target_net is not None:
-                    # Use target network (EMA or teacher) at σ_s.
-                    # Note: if target_net is the teacher, we pass sigma_s_eff (1D) to match
-                    # the teacher's EDMPrecond interface; if it's the student EMA, we pass
-                    # sigma_s (4D broadcast). Both work because EDMPrecond accepts both shapes.
-                    sigma_for_target = sigma_s_eff[idx_g] if self.target_net is self.teacher_net else sigma_s[idx_g]
-                    x_hat_s_ng = self.target_net(
-                        x_s_teach[idx_g],
+                    # EMA TARGET PATH:
+                    # Ensure your EMA network is actually in .train() mode in your training_loop!
+                    # We run the FULL batch to guarantee identical mask alignment.
+                    sigma_for_target = sigma_s_eff if self.target_net is self.teacher_net else sigma_s
+                    x_hat_s_full = self.target_net(
+                        x_s_teach,
                         sigma_for_target,
-                        labels[idx_g] if labels is not None else None,
-                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                        labels,
+                        augment_labels=augment_labels
                     ).to(torch.float32)
                 else:
-                    # Standard path: use live STUDENT at σ_s.
-                    # Disable dropout/label_dropout for the target reference so the
-                    # inv-DDIM target is deterministic (matches ema/teacher modes
-                    # which are already .eval()).  Only GroupNorm is used (no running
-                    # stats), so eval/train toggle is safe.
-                    net.eval()
-                    x_hat_s_ng = net(
-                        x_s_teach[idx_g],
-                        sigma_s[idx_g],              # [N_g,1,1,1]
-                        labels[idx_g] if labels is not None else None,
-                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                    # Walk through the network looking specifically for UNetBlocks
+                    # for name, module in net.named_modules():
+                        # Only attach to blocks that actually have dropout enabled
+                    #    if type(module).__name__ == 'UNetBlock' and module.dropout > 0:
+                            # Attach the wiretap to the conv1 layer INSIDE the block
+                    #        hooks.append(module.conv1.register_forward_hook(save_mask_hook))
+                    # --- End Dropout Mask Capture ---
+                    # LIVE TARGET PATH:
+                    # Run the live student on the FULL batch
+                    x_hat_s_full = net(
+                        x_s_teach,
+                        sigma_s,              
+                        labels,
+                        augment_labels=augment_labels
                     ).to(torch.float32)
-                    net.train()
+                    
+                # --- Remove Hooks and Log ---
+                # for hook in hooks:
+                #     hook.remove()
+                # --- End Remove Hooks and Log ---
+                    
+                # 3. Slice out only the general edges we actually need for the target
+                x_hat_s_ng = x_hat_s_full[idx_g]
             
             ratio_s_b = (sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)).to(torch.float32)
             x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g].to(torch.float32) - x_hat_s_ng)
@@ -601,7 +625,56 @@ class EDMConsistencyDistillLoss:
             raise ValueError(error_msg) from e
 
         # Student prediction at t (net is back in .train() mode → dropout active)
+        if 'rng_state' in locals():
+            torch.cuda.set_rng_state(rng_state)
+            
+        # --- Dropout Mask Capture for Debugging ---
+        # dropout_masks_s = []
+        # def save_mask_hook_s(module, inputs, output):
+            # 'inputs' is a tuple of what went INTO conv1. 
+            # inputs[0] is the tensor that just came out of functional.dropout
+        #     dropped_tensor = inputs[0]
+        #     mask = (dropped_tensor == 0).byte()
+        #     dropout_masks_s.append(mask)
+        # Walk through the network looking specifically for UNetBlocks
+        # for name, module in net.named_modules():
+            # Only attach to blocks that actually have dropout enabled
+        #     if type(module).__name__ == 'UNetBlock' and module.dropout > 0:
+                # Attach the wiretap to the conv1 layer INSIDE the block
+        #         hooks.append(module.conv1.register_forward_hook(save_mask_hook_s))
+        # --- End Dropout Mask Capture ---
+        
         x_hat_t = net(x_t, sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
+        # --- Remove Hooks and Log ---
+        # for hook in hooks:
+        #     hook.remove()
+        # if dropout_masks_t:
+        #     rank = dist.get_rank()
+        #     print(f"[GPU {rank}] Captured {len(dropout_masks_t)} teacher dropout masks in {dropout_masks_t[0].device}")
+        #     for i, mask in enumerate(dropout_masks_t):
+        #         print(f"[GPU {rank}] teacher Mask {i+1} shape: {mask.shape} in {dropout_masks_t[i].device}")
+                
+        #     print(f"[GPU {rank}] Example mask values (teacher path): {dropout_masks_t[0].flatten()[:10]}")
+        #     print(f"[GPU {rank}] Captured {len(dropout_masks_s)} student dropout masks in {dropout_masks_s[0].device}")
+        #     for i, mask in enumerate(dropout_masks_s):
+        #         print(f"[GPU {rank}] student Mask {i+1} shape: {mask.shape} in {dropout_masks_s[i].device} in in {dropout_masks_s[0].device}")
+        #     print(f"[GPU {rank}] Example mask values (student path): {dropout_masks_s[0].flatten()[:10]}")
+            
+            # Sanity check: ensure the same number of masks were captured on teacher and student paths, indicating aligned hook placement and consistent dropout structure.
+        #     assert len(dropout_masks_t) == len(dropout_masks_s), \
+        #         f"Topology mismatch! Target has {len(dropout_masks_t)} masks, Student has {len(dropout_masks_s)}."
+            # Iterate through every single captured layer sequentially
+        #     for i, (mask_t, mask_s) in enumerate(zip(dropout_masks_t, dropout_masks_s)):
+                
+                # torch.equal checks if shapes match AND every single element is identical
+        #         assert torch.equal(mask_t, mask_s), \
+        #             f"CRITICAL FAILURE: Dropout masks misaligned at layer index {i}!\n" \
+        #             f"Teacher mask {i}: {mask_t.flatten()}\n" \
+        #             f"Student mask {i}: {mask_s.flatten()}\n"
+            
+            # If the script doesn't crash from the asserts, you have achieved perfect synchronization!
+        #     print(f"[GPU {rank}] SUCCESS: All {len(dropout_masks_t)} dropout layers perfectly synchronized!")
+        # --- End Remove Hooks and Log ---
 
         # Weighting and loss
         # _weight expects 1D sigma vector [N]

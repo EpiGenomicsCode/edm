@@ -62,7 +62,7 @@ export EDM_DDP_FIND_UNUSED_PARAMETERS=0
 
 # Run training with torchrun and arguments per prompt
 torchrun --standalone --nproc_per_node=4 train.py \
-  --outdir=/work/hdd/bbse/xyou1/edm-training-runs/imagenet64-cd-s8/AdamClip0 \
+  --outdir=/work/hdd/bbse/xyou1/edm-training-runs/imagenet64-cd-s8/AdamClip0_Dropout \
   --data=/work/nvme/bbse/vmathew/edm_training/edm/datasets/imagenet-64x64.zip \
   --cond=1 --arch=adm --precond=edm \
   --batch=2048 --batch-gpu=64 --fp16=True --ema=50 --lr=8e-5 --ema_rampup=0.05 --grad-clip=0.0 \
@@ -76,7 +76,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --rho=7 --sigma_min=0.002 --sigma_max=80 \
   --cd_loss=pseudo_huber --cd_weight_mode=sqrt_karras \
   --wandb=True --wandb_project=edm-cd --wandb_entity=vinaysmathew-penn-state \
-  --wandb_run=imagenet64-cd-s8-live-Adam-Clip0 --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
+  --wandb_run=imagenet64-cd-s8-live-Adam-Clip0-Dropout --wandb_tags=imagenet,cd,s8 --wandb_mode=online \
   --val=1 \
   --val_teacher=False \
   --snap=20 \
@@ -86,8 +86,8 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --val_steps=8 \
   --val_every=20 \
   --val_at_start=0 \
-  --dropout=0.0 \
+  --dropout=0.2 \
   --seed=1959836853 \
   --workers=4 \
-  #--resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00000-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-002050.pt      
+  #--resume=/u/xyou1/edm/training-runs/imagenet64-cd-s8/00000-imagenet-64x64-cond-adm-edm-gpus4-batch2048-fp16-cdS8-T64-1280/training-state-002050.pt \
   #--cd_target_ema=0.95
