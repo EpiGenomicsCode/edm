@@ -69,8 +69,7 @@ def parse_int_list(s):
     show_default=True,
 )
 @click.option('--snap_cd_eval',  help='Optional: ticks interval for tiny S-step sanity samples (0=off)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
-@click.option('--cd_target_mode', help='Target network for sigma_s denoiser: live|ema|teacher', metavar='STR', type=click.Choice(['live', 'ema', 'teacher']), default='live', show_default=True)
-@click.option('--cd_target_ema', help='EMA rate for target network (only used if cd_target_mode=ema)', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.95, show_default=True)
+@click.option('--sync_dropout/--no_sync_dropout', help='Synchronize CUDA RNG for dropout between student and nograd target', default=True, show_default=True)
 @click.option('--sampling_mode', help='Edge sampling distribution: uniform|vp (MSCD)|edm (log-normal)', metavar='STR', type=click.Choice(['uniform', 'vp', 'edm']), default='vp', show_default=True)
 @click.option('--terminal_anchor/--no_terminal_anchor', help='Anchor terminal edge (σ_min→0) to 1/T probability matching MSCD paper', default=True, show_default=True)
 @click.option('--terminal_teacher_hop/--no_terminal_teacher_hop', help='Terminal edge uses teacher Euler hop D(x_t,σ_min) instead of clean image y', default=False, show_default=True)
@@ -237,13 +236,11 @@ def main(**kwargs):
             sampling_mode=opts.sampling_mode,
             terminal_anchor=opts.terminal_anchor,
             terminal_teacher_hop=opts.terminal_teacher_hop,
+            sync_dropout=opts.sync_dropout,
         )
         # Provenance and optional eval knob (stored only).
         c.teacher = opts.teacher
         c.snap_cd_eval = opts.snap_cd_eval
-        # Target network mode for sigma_s denoiser (OpenAI CM style).
-        c.cd_target_mode = opts.cd_target_mode
-        c.cd_target_ema = opts.cd_target_ema
         # Note: do NOT auto-seed student weights from teacher by default to avoid
         # label embedding shape mismatches across checkpoints/datasets.
 

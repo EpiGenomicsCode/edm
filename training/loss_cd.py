@@ -115,8 +115,8 @@ class EDMConsistencyDistillLoss:
         sigma_data: float = 0.5,
         enable_stats: bool = True,
         debug_invariants: bool = False,  # Enable runtime invariant checks (PRD §5, R7)
-        target_net = None,  # Optional: separate target network for sigma_s denoiser (OpenAI CM style EMA or teacher)
         sampling_mode: str = "vp",  # Edge sampling: "uniform" | "vp" (MSCD uniform-t) | "edm" (log-normal)
+        sync_dropout: bool = True,  # Synchronize CUDA RNG for dropout between student and nograd target
         terminal_anchor: bool = True,  # Anchor terminal edge to 1/T probability (matches MSCD paper)
         terminal_teacher_hop: bool = False,  # Use teacher Euler hop for terminal edge instead of clean image y
     ):
@@ -152,16 +152,11 @@ class EDMConsistencyDistillLoss:
         self.sigma_data = float(sigma_data)
         self.enable_stats = enable_stats
         self.debug_invariants = debug_invariants
-        # Optional target network for sigma_s denoiser (OpenAI CM style).
-        # Three modes via training_loop's cd_target_mode:
-        # - None (default): use live student weights at σ_s
-        # - EMA copy of student: stabilizes training (OpenAI's approach, rate=0.95)
-        # - Frozen teacher: for debugging
-        self.target_net = target_net
         assert sampling_mode in ("uniform", "vp", "edm"), f"Invalid sampling_mode: {sampling_mode}"
         self.sampling_mode = sampling_mode
         self.terminal_anchor = bool(terminal_anchor)
         self.terminal_teacher_hop = bool(terminal_teacher_hop)
+        self.sync_dropout = bool(sync_dropout)
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -186,14 +181,6 @@ class EDMConsistencyDistillLoss:
         the current global kimg (including resume_kimg).
         """
         self._global_kimg = float(kimg)
-    
-    def set_target_net(self, target_net) -> None:
-        """
-        Set or update the target network used for sigma_s denoiser in general edges.
-        The training loop is responsible for maintaining this EMA copy and updating
-        it via this method.
-        """
-        self.target_net = target_net
     
     def get_edge_stats(self, reset: bool = True) -> dict:
         """
@@ -526,44 +513,50 @@ class EDMConsistencyDistillLoss:
         x_ref_bdry[boundary_mask] = x_s_teach[boundary_mask]  # already float64
         sigma_ref_vec[boundary_mask] = sigma_s_eff[boundary_mask]
         
-        # General interior edges: push from σ_s to σ_bdry using a denoiser at σ_s.
-        # Two modes (controlled via training_loop's cd_target_mode):
-        # 1. target_net is provided: use TARGET (EMA or teacher) at σ_s (OpenAI CM style)
-        # 2. default: use live STUDENT at σ_s (standard CD)
+        # ---- Student forward at σ_t (with grad, train mode, dropout active) ----
+        # When sync_dropout is enabled, save CUDA RNG state so the nograd target
+        # pass can restore it and produce identical dropout masks (TCM pattern).
+        if self.sync_dropout:
+            rng_state = torch.cuda.get_rng_state()
+
+        x_hat_t = net(x_t.float(), sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
+
+        # ---- General interior edges: nograd student at σ_s, DDIM push to σ_bdry ----
         if general_mask.any():
-            idx_g = general_mask
             with torch.no_grad():
-                if self.target_net is not None:
-                    sigma_for_target = sigma_s_eff[idx_g] if self.target_net is self.teacher_net else sigma_s[idx_g]
-                    x_hat_s_ng = self.target_net(
-                        x_s_teach[idx_g].float(),
-                        sigma_for_target,
-                        labels[idx_g] if labels is not None else None,
-                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                if self.sync_dropout:
+                    # Restore CUDA RNG → identical dropout masks as student forward.
+                    # Run full batch so RNG consumption matches the student call;
+                    # only general-mask outputs are actually used.
+                    torch.cuda.set_rng_state(rng_state)
+                    target_x = x_t.clone()
+                    target_x[general_mask] = x_s_teach[general_mask]
+                    target_sigma = sigma_t.clone()
+                    target_sigma[general_mask] = sigma_s[general_mask]
+                    x_hat_full = net(
+                        target_x.float(), target_sigma,
+                        labels, augment_labels=augment_labels,
                     ).to(torch.float64)
+                    x_hat_s_ng = x_hat_full[general_mask]
                 else:
                     net.eval()
                     x_hat_s_ng = net(
-                        x_s_teach[idx_g].float(),
-                        sigma_s[idx_g],
-                        labels[idx_g] if labels is not None else None,
-                        augment_labels=augment_labels[idx_g] if augment_labels is not None else None,
+                        x_s_teach[general_mask].float(),
+                        sigma_s[general_mask],
+                        labels[general_mask] if labels is not None else None,
+                        augment_labels=augment_labels[general_mask] if augment_labels is not None else None,
                     ).to(torch.float64)
                     net.train()
-            
-            # DDIM step in float64: x_ref = x̂_s + (σ_bdry/σ_s) * (x_s_teach - x̂_s)
-            ratio_s_b = sigma_bdry[idx_g] / torch.clamp(sigma_s[idx_g], min=tol)
-            x_ref_bdry[idx_g] = x_hat_s_ng + ratio_s_b * (x_s_teach[idx_g] - x_hat_s_ng)
-            sigma_ref_vec[idx_g] = sigma_bdry_vec[idx_g]
+
+            ratio_s_b = sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=tol)
+            x_ref_bdry[general_mask] = x_hat_s_ng + ratio_s_b * (x_s_teach[general_mask] - x_hat_s_ng)
+            sigma_ref_vec[general_mask] = sigma_bdry_vec[general_mask]
 
         # Gain diagnostics: σ_ref / σ_t and CD gain 1 / (1 - σ_ref/σ_t).
-        # This is purely diagnostic and does not affect training dynamics.
         ratio_ref = sigma_ref_vec / torch.clamp(sigma_t_vec, min=1e-12)
         gain = 1.0 / torch.clamp(1.0 - ratio_ref, min=1e-6)  # [N]
 
         # Compute inv-DDIM target at t using per-sample sigma_ref.
-        # All inputs are float64; inv_ddim_edm does its arithmetic in float64.
-        # Cast result to float32 only for the loss computation.
         try:
             x_hat_t_star = inv_ddim_edm(
                 x_ref=x_ref_bdry,         # float64
@@ -572,7 +565,6 @@ class EDMConsistencyDistillLoss:
                 sigma_ref=sigma_ref_vec,  # [N]
             ).to(torch.float32)
         except ValueError as e:
-            # Add sampling context to the error message
             error_msg = str(e) + "\n\n  Sampling context for affected samples (first 5):\n"
             bad_idx = (torch.abs(sigma_ref_vec - sigma_t_vec) < 1e-8).nonzero(as_tuple=False).view(-1)[:5]
             for idx in bad_idx:
@@ -586,10 +578,6 @@ class EDMConsistencyDistillLoss:
                     f"sigma_ref={sigma_ref_vec[i].item():.9f}\n"
                 )
             raise ValueError(error_msg) from e
-
-        # Student prediction at t (net is back in .train() mode → dropout active).
-        # Network runs in float32; x_t is float64 so cast for the forward pass.
-        x_hat_t = net(x_t.float(), sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
 
         # Weighting and loss
         # _weight expects 1D sigma vector [N]

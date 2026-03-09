@@ -54,8 +54,7 @@ def training_loop(
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
     validation_kwargs   = None,     # Validation configuration (PRD-04).
-    cd_target_mode      = 'live',   # Target network mode for CD sigma_s denoiser: 'live' | 'ema' | 'teacher'.
-    cd_target_ema       = 0.95,     # EMA rate for target network (only used if cd_target_mode='ema').
+    # (cd_target_mode removed: only 'live' nograd-student is supported now)
 ):
     # Initialize.
     start_time = time.time()
@@ -129,13 +128,6 @@ def training_loop(
     )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     
-    # Initialize target network for CD sigma_s denoiser (OpenAI CM style).
-    # This is separate from the validation EMA and is used during training.
-    target_ema_net = None
-    if hasattr(loss_fn, 'teacher_net') and cd_target_mode == 'ema':
-        target_ema_net = copy.deepcopy(net).eval().requires_grad_(False)
-        dist.print0(f'[CD TARGET] Initialized target EMA network with rate={cd_target_ema}')
-    
     # Force fp16 on teacher network (matches student override above).
     if hasattr(loss_fn, 'teacher_net') and hasattr(loss_fn.teacher_net, 'use_fp16') and not loss_fn.teacher_net.use_fp16:
         dist.print0('[OVERRIDE] Forcing use_fp16=True on teacher network')
@@ -166,9 +158,6 @@ def training_loop(
                 misc.copy_params_and_buffers(src_module=teacher, dst_module=net, require_all=False)
                 # Also update EMA to start from teacher weights.
                 misc.copy_params_and_buffers(src_module=teacher, dst_module=ema, require_all=False)
-                # Also update target EMA if it exists.
-                if target_ema_net is not None:
-                    misc.copy_params_and_buffers(src_module=teacher, dst_module=target_ema_net, require_all=False)
                 if dist.get_rank() == 0:
                     dist.print0('[CD INIT] Seeded student & EMA from teacher (all parameter/buffer shapes match).')
             else:
@@ -178,20 +167,8 @@ def training_loop(
             if dist.get_rank() == 0:
                 dist.print0(f'[CD INIT] Failed to seed from teacher: {_e}')
     
-    # Configure the loss function's target network based on cd_target_mode.
-    if hasattr(loss_fn, 'set_target_net'):
-        if cd_target_mode == 'live':
-            # No target network; loss will use live student weights (default behavior).
-            loss_fn.set_target_net(None)
-        elif cd_target_mode == 'ema':
-            # Use the target EMA network.
-            loss_fn.set_target_net(target_ema_net)
-        elif cd_target_mode == 'teacher':
-            # Use the frozen teacher for sigma_s denoiser.
-            loss_fn.set_target_net(loss_fn.teacher_net)
-            dist.print0('[CD TARGET] Using frozen teacher for sigma_s denoiser.')
-        else:
-            raise ValueError(f'Unknown cd_target_mode: {cd_target_mode}')
+    # CD target mode is now always 'live' (nograd student with sync dropout).
+    # No separate target network is needed.
 
     # Optional W&B initialization (async/threaded).
     wandb_run = None
@@ -244,10 +221,6 @@ def training_loop(
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
-        # Load target_ema if it was saved and we're using it.
-        if target_ema_net is not None and 'target_ema' in data:
-            misc.copy_params_and_buffers(src_module=data['target_ema'], dst_module=target_ema_net, require_all=True)
-            dist.print0('[CD TARGET] Loaded target EMA from training state.')
         del data # conserve memory
 
     # Broadcast run_dir to all ranks (rank 0 has it, others have None).
@@ -532,18 +505,6 @@ def training_loop(
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
         ema_updates += 1
         
-        # Update target EMA (for CD sigma_s denoiser, OpenAI CM style).
-        # This uses a fixed EMA rate (no rampup), matching OpenAI's "fixed" mode.
-        if target_ema_net is not None:
-            target_ema_beta = cd_target_ema  # e.g., 0.95
-            for p_target, p_net in zip(target_ema_net.parameters(), net.parameters()):
-                p_target.mul_(target_ema_beta).add_(p_net.detach(), alpha=1 - target_ema_beta)
-            # Update the loss function's reference to the target network.
-            # (The target_net itself is updated in-place, but we call set_target_net
-            # to ensure the loss function has the correct reference after resume/reload.)
-            if hasattr(loss_fn, 'set_target_net'):
-                loss_fn.set_target_net(target_ema_net)
-
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
         done = (cur_nimg >= total_kimg * 1000)
@@ -661,9 +622,6 @@ def training_loop(
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] snapshot: starting', flush=True)
             data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-            # Also save target_ema if it exists (for CD target mode).
-            if target_ema_net is not None:
-                data['target_ema'] = target_ema_net
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] snapshot: processing {len(data)} items', flush=True)
             for key, value in data.items():
@@ -704,8 +662,6 @@ def training_loop(
                 print(f'[RANK {dist.get_rank()}] state_dump: starting', flush=True)
             state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
             # Also save target_ema state if it exists.
-            if target_ema_net is not None:
-                state_dict['target_ema'] = target_ema_net
             torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] state_dump: done', flush=True)
