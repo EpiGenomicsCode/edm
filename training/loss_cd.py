@@ -157,7 +157,6 @@ class EDMConsistencyDistillLoss:
         self.terminal_anchor = bool(terminal_anchor)
         self.terminal_teacher_hop = bool(terminal_teacher_hop)
         self.sync_dropout = bool(sync_dropout)
-        self._sync_dropout_verified = False  # one-time verification flag (delete after confirming)
 
         # Global kimg for teacher annealing; set externally by training loop.
         # Defaults to 0 if not explicitly set.
@@ -521,25 +520,6 @@ class EDMConsistencyDistillLoss:
             rng_state = torch.cuda.get_rng_state()
 
         x_hat_t = net(x_t.float(), sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
-
-        # #region agent log — one-time sync-dropout verification (delete after confirming)
-        if self.sync_dropout and not self._sync_dropout_verified:
-            self._sync_dropout_verified = True
-            torch.cuda.set_rng_state(rng_state)
-            with torch.no_grad():
-                _x_hat_verify = net(x_t.float(), sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
-            _exact_match = torch.equal(x_hat_t.detach(), _x_hat_verify)
-            _max_diff = (x_hat_t.detach() - _x_hat_verify).abs().max().item()
-            _mean_diff = (x_hat_t.detach() - _x_hat_verify).abs().mean().item()
-            print(
-                f'[sync_dropout_verify] bitwise_identical={_exact_match} '
-                f'max_diff={_max_diff:.3e} mean_diff={_mean_diff:.3e} '
-                f'batch={batch_size}',
-                flush=True,
-            )
-            # Restore RNG state once more so the subsequent target forward gets a clean restore
-            torch.cuda.set_rng_state(rng_state)
-        # #endregion agent log
 
         # ---- General interior edges: nograd student at σ_s, DDIM push to σ_bdry ----
         if general_mask.any():
