@@ -38,6 +38,16 @@ def parse_int_list(s):
             ranges.append(int(p))
     return ranges
 
+def parse_float_list(s):
+    if s is None:
+        return None
+    if isinstance(s, list):
+        return [float(x) for x in s]
+    s = str(s).strip()
+    if s == '' or s.lower() in ('none', 'null', 'off', '0'):
+        return None
+    return [float(x.strip()) for x in s.split(',') if x.strip() != '']
+
 #----------------------------------------------------------------------------
 
 @click.command()
@@ -83,6 +93,8 @@ def parse_int_list(s):
 @click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=2e-6, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
 @click.option('--ema_rampup',    help='EMA rampup ratio (0=disable rampup, Song uses 0)', metavar='FLOAT', type=click.FloatRange(min=0), default=0.05, show_default=True)
+@click.option('--phema',         help='Power-function EMA stds for post-hoc reconstruction (comma list, e.g. 0.05,0.10; empty=off)', metavar='LIST', type=str, default='', show_default=True)
+@click.option('--phema_snap',    help='PHEMA snapshot interval in ticks (default: same as --snap)', metavar='TICKS', type=click.IntRange(min=1), default=None)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.00, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
@@ -263,6 +275,8 @@ def main(**kwargs):
     c.total_kimg = max(int(opts.duration * 1000), 1)
     c.ema_halflife_kimg = int(opts.ema * 1000)
     c.ema_rampup_ratio = opts.ema_rampup if opts.ema_rampup > 0 else None
+    c.phema_stds = parse_float_list(opts.phema)
+    c.phema_snapshot_ticks = opts.phema_snap
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
