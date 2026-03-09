@@ -525,33 +525,18 @@ class EDMConsistencyDistillLoss:
         # #region agent log — one-time sync-dropout verification (delete after confirming)
         if self.sync_dropout and not self._sync_dropout_verified:
             self._sync_dropout_verified = True
-            import json as _json
-            _log_path = '/Users/vinay/edm/.cursor/debug-6b70d4.log'
             torch.cuda.set_rng_state(rng_state)
             with torch.no_grad():
                 _x_hat_verify = net(x_t.float(), sigma_t, labels, augment_labels=augment_labels).to(torch.float32)
             _exact_match = torch.equal(x_hat_t.detach(), _x_hat_verify)
             _max_diff = (x_hat_t.detach() - _x_hat_verify).abs().max().item()
             _mean_diff = (x_hat_t.detach() - _x_hat_verify).abs().mean().item()
-            _entry = {
-                'sessionId': '6b70d4',
-                'location': 'loss_cd.py:sync_dropout_verify',
-                'message': 'Sync dropout verification (same input, same RNG)',
-                'data': {
-                    'bitwise_identical': _exact_match,
-                    'max_abs_diff': _max_diff,
-                    'mean_abs_diff': _mean_diff,
-                    'batch_size': batch_size,
-                    'sync_dropout': True,
-                },
-                'hypothesisId': 'sync_verify',
-                'timestamp': int(__import__('time').time() * 1000),
-            }
-            try:
-                with open(_log_path, 'a') as _f:
-                    _f.write(_json.dumps(_entry) + '\n')
-            except Exception:
-                pass
+            print(
+                f'[sync_dropout_verify] bitwise_identical={_exact_match} '
+                f'max_diff={_max_diff:.3e} mean_diff={_mean_diff:.3e} '
+                f'batch={batch_size}',
+                flush=True,
+            )
             # Restore RNG state once more so the subsequent target forward gets a clean restore
             torch.cuda.set_rng_state(rng_state)
         # #endregion agent log
