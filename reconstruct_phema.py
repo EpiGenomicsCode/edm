@@ -89,13 +89,17 @@ def kimg_to_nimg(kimg, batch_size=None):
         return kimg * 1000
     lo = kimg * 1000
     hi = lo + 1000
-    # Smallest multiple of batch_size >= lo
+    # When batch_size > 1000, there is at most one multiple of batch_size in
+    # [lo, hi), and it is the exact cur_nimg that the training loop had when
+    # writing this file — giving identical math to EDM2's original intent.
     nimg = ((lo + batch_size - 1) // batch_size) * batch_size
     if nimg < hi:
         return nimg
-    # Edge case: no multiple in [lo, hi).  Use nearest below.
-    nimg = (lo // batch_size) * batch_size
-    return nimg
+    raise click.ClickException(
+        f'Cannot recover exact nimg for kimg={kimg} with batch_size={batch_size}: '
+        f'no multiple of {batch_size} in [{lo}, {hi}). '
+        f'This file may not have been produced with this batch size.'
+    )
 
 #----------------------------------------------------------------------------
 # List input pickles for post-hoc EMA reconstruction.
