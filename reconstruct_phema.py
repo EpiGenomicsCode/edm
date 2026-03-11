@@ -78,11 +78,23 @@ def pkl_path(dir, prefix, nimg, std):
     return os.path.join(dir, name)
 
 #----------------------------------------------------------------------------
-# Deduce nimg based on kimg (= nimg//1000).
+# Recover exact nimg from kimg and batch_size.
+#
+# cur_nimg is always a multiple of batch_size.  The filename stores
+# kimg = cur_nimg // 1000.  Given batch_size we find the unique multiple
+# of batch_size in [kimg*1000, (kimg+1)*1000).
 
-def kimg_to_nimg(kimg):
-    nimg = (kimg * 1000 + 999) // 1024 * 1024
-    assert nimg // 1000 == kimg
+def kimg_to_nimg(kimg, batch_size=None):
+    if batch_size is None:
+        return kimg * 1000
+    lo = kimg * 1000
+    hi = lo + 1000
+    # Smallest multiple of batch_size >= lo
+    nimg = ((lo + batch_size - 1) // batch_size) * batch_size
+    if nimg < hi:
+        return nimg
+    # Edge case: no multiple in [lo, hi).  Use nearest below.
+    nimg = (lo // batch_size) * batch_size
     return nimg
 
 #----------------------------------------------------------------------------
@@ -93,6 +105,7 @@ def list_input_pickles(
     in_dir,             # Directory containing the input pickles.
     in_prefix   = None, # Input filename prefix. None = anything goes.
     in_std      = None, # Relative standard deviations of the input pickles. None = anything goes.
+    batch_size  = None, # Training batch size for exact nimg recovery (optional).
 ):
     if not os.path.isdir(in_dir):
         raise click.ClickException('Input directory does not exist')
@@ -105,12 +118,27 @@ def list_input_pickles(
             if not m or not e.is_file():
                 continue
             prefix = m.group(1)
-            nimg = kimg_to_nimg(int(m.group(2)))
+            kimg = int(m.group(2))
             std = float(m.group(3))
             if in_prefix is not None and prefix != in_prefix:
                 continue
             if in_std is not None and std not in in_std:
                 continue
+
+            # Try to read exact nimg from the pickle (written by training loop).
+            nimg = None
+            try:
+                with open(e.path, 'rb') as f:
+                    data = pickle.load(f)
+                if 'nimg' in data:
+                    nimg = int(data['nimg'])
+                del data
+            except Exception:
+                pass
+
+            if nimg is None:
+                nimg = kimg_to_nimg(kimg, batch_size=batch_size)
+
             pkls.append(dnnlib.EasyDict(path=e.path, nimg=nimg, std=std))
     pkls = sorted(pkls, key=lambda pkl: (pkl.nimg, pkl.std))
     return pkls
@@ -261,8 +289,9 @@ def parse_std_list(s):
 
 @click.option('--skip', 'skip_existing',    help='Skip output files that already exist',                            is_flag=True)
 @click.option('--batch', 'max_batch_size',  help='Maximum simultaneous reconstructions', metavar='INT',             type=click.IntRange(min=1), default=8, show_default=True)
+@click.option('--training_batch',           help='Training batch size for exact nimg recovery from kimg filenames',  metavar='INT', type=click.IntRange(min=1), default=None)
 
-def cmdline(in_dir, in_prefix, in_std, out_kimg, **opts):
+def cmdline(in_dir, in_prefix, in_std, out_kimg, training_batch, **opts):
     """Perform post-hoc EMA reconstruction.
 
     Examples:
@@ -289,8 +318,8 @@ def cmdline(in_dir, in_prefix, in_std, out_kimg, **opts):
     """
     if os.environ.get('WORLD_SIZE', '1') != '1':
         raise click.ClickException('Distributed execution is not supported')
-    out_nimg = kimg_to_nimg(out_kimg) if out_kimg is not None else None
-    in_pkls = list_input_pickles(in_dir=in_dir, in_prefix=in_prefix, in_std=in_std)
+    out_nimg = kimg_to_nimg(out_kimg, batch_size=training_batch) if out_kimg is not None else None
+    in_pkls = list_input_pickles(in_dir=in_dir, in_prefix=in_prefix, in_std=in_std, batch_size=training_batch)
     rec_iter = reconstruct_phema(in_pkls=in_pkls, out_nimg=out_nimg, **opts)
     for _r in tqdm.tqdm(rec_iter, unit='step'):
         pass

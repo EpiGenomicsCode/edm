@@ -692,7 +692,7 @@ def training_loop(
                     base_cpu[key] = value
                 del value
             for ema_net, ema_suffix in phema_list:
-                data_phema = dict(base_cpu, ema=copy.deepcopy(ema_net).eval().requires_grad_(False).cpu())
+                data_phema = dict(base_cpu, ema=copy.deepcopy(ema_net).eval().requires_grad_(False).cpu(), nimg=cur_nimg)
                 if dist.get_rank() == 0:
                     std_str = ema_suffix.lstrip('-')  # e.g. "0.050"
                     fname = f'network-snapshot-{cur_nimg//1000:06d}-{std_str}.pkl'
