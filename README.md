@@ -167,8 +167,6 @@ train.py ... --resume=training-runs/imagenet64-cd-s8/00000-.../training-state-11
 | Teacher sampler | aDDIM | Heun 2nd-order |
 | Parameterization | ε-prediction | EDM preconditioning |
 | Segmentation | Index-based | Sigma-anchored |
-| Dropout | Standard | Synchronized across student and target |
-| EMA | Single exponential | Power-function EMA (multiple stds), from EDM2 \[3\] |
 
 ## Key Files
 
