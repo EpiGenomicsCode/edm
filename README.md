@@ -78,12 +78,12 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --consistency=True \
   --dropout=0.13 \
   --teacher=edm-imagenet-64x64-cond-adm.pkl \
-  --S=8 --T_start=64 --T_end=1280 --T_anneal_kimg=204800 \
+  --S=8 --T_start=64 --T_end=1280 --T_anneal_kimg=104800 \
   --rho=7 --sigma_min=0.002 --sigma_max=80 \
   --cd_loss=pseudo_huber --cd_weight_mode=sqrt_karras \
   --sampling_mode=edm \
   --terminal_anchor --terminal_teacher_hop \
-  --duration=410 \
+  --duration=210 \
   --val=1 --val_ref=fid-refs/imagenet-64x64.npz \
   --val_every=20 --val_steps=8 \
   --snap=20 --dump=20
@@ -122,7 +122,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
 | `--S=8` | Number of student inference steps (segments) |
 | `--T_start=64` | Number of teacher Heun steps at the start of training |
 | `--T_end=1280` | Number of teacher Heun steps at the end of annealing |
-| `--T_anneal_kimg=204800` | How many kimg to ramp from T_start to T_end (~half the total run) |
+| `--T_anneal_kimg=104800` | How many kimg to ramp from T_start to T_end (~half the total run) |
 | `--rho=7` | Karras schedule exponent (matches EDM paper) |
 | `--sigma_min=0.002` | Minimum noise level |
 | `--sigma_max=80` | Maximum noise level |
@@ -137,7 +137,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
 
 | Option | Description |
 |--------|-------------|
-| `--duration=410` | Total training duration in Mimg (410 million images seen) |
+| `--duration=210` | Total training duration in Mimg (210 million images seen) |
 | `--snap=20` | Save network snapshot (`.pkl`) every 20 ticks |
 | `--dump=20` | Save full training state (`.pt`) every 20 ticks for resuming; the training loop automatically retains only the 2 most recent state files plus the one at the best validation FID |
 
