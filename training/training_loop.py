@@ -8,6 +8,7 @@
 """Main training loop."""
 
 import os
+import glob
 import time
 import copy
 import json
@@ -715,9 +716,34 @@ def training_loop(
             if phema is not None:
                 state_dict['phema'] = phema.state_dict()
             torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            # Keep the 2 most recent state files plus the one corresponding to the
+            # best validation FID seen so far. Delete everything else.
+            best_fid_state = None
+            metrics_val_path = os.path.join(run_dir, 'metrics-val.jsonl')
+            if os.path.exists(metrics_val_path):
+                try:
+                    best_entry = min(
+                        (json.loads(line) for line in open(metrics_val_path) if line.strip()),
+                        key=lambda x: x.get('fid', float('inf')),
+                        default=None,
+                    )
+                    if best_entry is not None and best_entry.get('kimg') is not None:
+                        best_fid_state = os.path.join(run_dir, f'training-state-{int(best_entry["kimg"]):06d}.pt')
+                except Exception:
+                    pass
+            all_states = sorted(glob.glob(os.path.join(run_dir, 'training-state-*.pt')))
+            protected = set(all_states[-2:])
+            if best_fid_state is not None:
+                protected.add(best_fid_state)
+            for state_path in all_states:
+                if state_path not in protected:
+                    try:
+                        os.remove(state_path)
+                    except OSError:
+                        pass
             if os.environ.get('CD_DDP_DEBUG'):
                 print(f'[RANK {dist.get_rank()}] state_dump: done', flush=True)
-        # All ranks participate in this barrier exactly on the same ticks where we dump
+        # All ranks participate in this barrier exactly on the sWhen you speak to it and it types whatever you're saying, but it's crazy accurate like that is for likeame ticks where we dump
         # state, ensuring no one starts the next iteration early relative to rank 0.
         if need_state_dump:
             torch.distributed.barrier()
