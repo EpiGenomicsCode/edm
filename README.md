@@ -9,7 +9,7 @@ Implementation of [Multi-Step Consistency Models](https://arxiv.org/abs/2403.068
 | Teacher (EDM, Heun) | 512 | 2.3 |
 | **Student (this, S=8)** | **8** | **2.7** |
 
-The 8-step student was trained for 410 Mimg on 32 GPUs (8 nodes × 4 A100s) using the full configuration below.
+The 8-step student was trained for 210 Mimg on 32 GPUs (8 nodes × 4 H100s) using the full configuration below.
 
 **[Download pretrained student checkpoint (phema-0206182-0.150.pkl)](https://drive.google.com/file/d/1GnYGrUnKCrKSdjA1YjI8JDLcGGxjjLU7/view?usp=share_link)**
 
@@ -85,43 +85,6 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --val=1 --val_ref=fid-refs/imagenet-64x64.npz \
   --val_every=20 --val_steps=8 \
   --snap=20 --dump=20
-```
-
-### Multi-node on SLURM (8 nodes × 4 GPUs = 32 GPUs)
-
-```bash
-# In your sbatch script:
-head_node_ip=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-MASTER_PORT=29500
-
-srun --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --kill-on-bad-exit=1 \
-  torchrun \
-    --nnodes="$SLURM_NNODES" \
-    --nproc_per_node=4 \
-    --node_rank="$SLURM_NODEID" \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint="${head_node_ip}:${MASTER_PORT}" \
-    --rdzv_id="$SLURM_JOB_ID" \
-  train.py \
-    --outdir=training-runs/imagenet64-cd-s8 \
-    --data=/path/to/imagenet-64x64.zip \
-    --cond=1 --arch=adm --precond=edm \
-    --batch=2048 --batch-gpu=64 --fp16=True \
-    --ema=50 --ema_rampup=0.05 --lr=8e-5 \
-    --phema=0.05,0.10 --phema_snap=60 \
-    --consistency=True \
-    --dropout=0.13 \
-    --teacher=/path/to/edm-imagenet-64x64-cond-adm.pkl \
-    --S=8 --T_start=64 --T_end=1280 --T_anneal_kimg=204800 \
-    --rho=7 --sigma_min=0.002 --sigma_max=80 \
-    --cd_loss=pseudo_huber --cd_weight_mode=sqrt_karras \
-    --sampling_mode=edm \
-    --terminal_anchor --terminal_teacher_hop \
-    --duration=410 \
-    --val=1 --val_ref=/path/to/fid-refs/imagenet-64x64.npz \
-    --val_every=20 --val_steps=8 \
-    --snap=20 --dump=20 \
-    --seed=1959836853
 ```
 
 ### Key Training Options
