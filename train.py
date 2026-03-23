@@ -96,6 +96,7 @@ def parse_float_list(s):
 @click.option('--phema',         help='Power-function EMA stds for post-hoc reconstruction (comma list, e.g. 0.05,0.10; empty=off)', metavar='LIST', type=str, default='', show_default=True)
 @click.option('--phema_snap',    help='PHEMA snapshot interval in ticks (default: same as --snap)', metavar='TICKS', type=click.IntRange(min=1), default=None)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.00, show_default=True)
+@click.option('--dout_resolutions', help='Apply dropout only at these resolutions (comma-separated, e.g. 16,8). None=all.', metavar='LIST', type=str, default=None)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
 
@@ -270,6 +271,8 @@ def main(**kwargs):
         # Only set augment_dim when we actually use AugmentPipe.
         c.network_kwargs.augment_dim = 9
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
+    if opts.dout_resolutions is not None:
+        c.network_kwargs.dout_resolutions = [int(x.strip()) for x in opts.dout_resolutions.split(',') if x.strip()]
 
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)

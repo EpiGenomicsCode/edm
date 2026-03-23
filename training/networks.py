@@ -137,6 +137,7 @@ class UNetBlock(torch.nn.Module):
         num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
         resample_filter=[1,1], resample_proj=False, adaptive_scale=True,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None,
+        dout_resolutions=None,  # Resolutions at which to apply dropout. None = all resolutions.
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -146,6 +147,7 @@ class UNetBlock(torch.nn.Module):
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
+        self.dout_resolutions = dout_resolutions
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
         self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
@@ -174,7 +176,8 @@ class UNetBlock(torch.nn.Module):
         else:
             x = silu(self.norm1(x.add_(params)))
 
-        x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
+        drop_p = self.dropout if (self.dout_resolutions is None or x.shape[-1] in self.dout_resolutions) else 0
+        x = self.conv1(torch.nn.functional.dropout(x, p=drop_p, training=self.training))
         x = x.add_(self.skip(orig) if self.skip is not None else orig)
         x = x * self.skip_scale
 
@@ -247,6 +250,7 @@ class SongUNet(torch.nn.Module):
         encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+        dout_resolutions    = None,         # Resolutions at which to apply dropout. None = all resolutions.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -263,6 +267,7 @@ class SongUNet(torch.nn.Module):
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
             init=init, init_zero=init_zero, init_attn=init_attn,
+            dout_resolutions=dout_resolutions,
         )
 
         # Mapping.
@@ -384,13 +389,14 @@ class DhariwalUNet(torch.nn.Module):
         attn_resolutions    = [32,16,8],    # List of resolutions with self-attention.
         dropout             = 0.10,         # List of resolutions with self-attention.
         label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+        dout_resolutions    = None,         # Resolutions at which to apply dropout. None = all resolutions.
     ):
         super().__init__()
         self.label_dropout = label_dropout
         emb_channels = model_channels * channel_mult_emb
         init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), init_bias=np.sqrt(1/3))
         init_zero = dict(init_mode='kaiming_uniform', init_weight=0, init_bias=0)
-        block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero)
+        block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero, dout_resolutions=dout_resolutions)
 
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=model_channels)
