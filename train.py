@@ -38,6 +38,16 @@ def parse_int_list(s):
             ranges.append(int(p))
     return ranges
 
+def parse_float_list(s):
+    if s is None:
+        return None
+    if isinstance(s, list):
+        return [float(x) for x in s]
+    s = str(s).strip()
+    if s == '' or s.lower() in ('none', 'null', 'off', '0'):
+        return None
+    return [float(x.strip()) for x in s.split(',') if x.strip() != '']
+
 #----------------------------------------------------------------------------
 
 @click.command()
@@ -59,18 +69,20 @@ def parse_int_list(s):
 @click.option('--rho',           help='Karras rho exponent', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=7.0, show_default=True)
 @click.option('--sigma_min',     help='Minimum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.002, show_default=True)
 @click.option('--sigma_max',     help='Maximum sigma for grids', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=80.0, show_default=True)
-@click.option('--cd_loss',       help='Consistency loss type', metavar='huber|l2', type=click.Choice(['huber', 'l2']), default='huber', show_default=True)
+@click.option('--cd_loss',       help='Consistency loss type', metavar='STR', type=click.Choice(['huber', 'l2', 'l2_root', 'pseudo_huber']), default='huber', show_default=True)
 @click.option(
     '--cd_weight_mode',
     help='Consistency weight mode',
-    metavar='edm|vlike|flat|snr|snr+1|karras|truncated-snr|uniform',
-    type=click.Choice(['edm', 'vlike', 'flat', 'snr', 'snr+1', 'karras', 'truncated-snr', 'uniform']),
+    metavar='edm|vlike|flat|snr|snr+1|karras|sqrt_karras|truncated-snr|uniform',
+    type=click.Choice(['edm', 'vlike', 'flat', 'snr', 'snr+1', 'karras', 'sqrt_karras', 'truncated-snr', 'uniform']),
     default='edm',
     show_default=True,
 )
 @click.option('--snap_cd_eval',  help='Optional: ticks interval for tiny S-step sanity samples (0=off)', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
-@click.option('--cd_target_mode', help='Target network for sigma_s denoiser: live|ema|teacher', metavar='STR', type=click.Choice(['live', 'ema', 'teacher']), default='live', show_default=True)
-@click.option('--cd_target_ema', help='EMA rate for target network (only used if cd_target_mode=ema)', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.95, show_default=True)
+@click.option('--sync_dropout/--no_sync_dropout', help='Synchronize CUDA RNG for dropout between student and nograd target', default=True, show_default=True)
+@click.option('--sampling_mode', help='Edge sampling distribution: uniform|vp (MSCD)|edm (log-normal)', metavar='STR', type=click.Choice(['uniform', 'vp', 'edm']), default='vp', show_default=True)
+@click.option('--terminal_anchor/--no_terminal_anchor', help='Anchor terminal edge (σ_min→0) to 1/T probability matching MSCD paper', default=True, show_default=True)
+@click.option('--terminal_teacher_hop/--no_terminal_teacher_hop', help='Terminal edge uses teacher Euler hop D(x_t,σ_min) instead of clean image y', default=False, show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -80,7 +92,10 @@ def parse_int_list(s):
 @click.option('--cres',          help='Channels per resolution  [default: varies]', metavar='LIST', type=parse_int_list)
 @click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=2e-6, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
-@click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
+@click.option('--ema_rampup',    help='EMA rampup ratio (0=disable rampup, Song uses 0)', metavar='FLOAT', type=click.FloatRange(min=0), default=0.05, show_default=True)
+@click.option('--phema',         help='Power-function EMA stds for post-hoc reconstruction (comma list, e.g. 0.05,0.10; empty=off)', metavar='LIST', type=str, default='', show_default=True)
+@click.option('--phema_snap',    help='PHEMA snapshot interval in ticks (default: same as --snap)', metavar='TICKS', type=click.IntRange(min=1), default=None)
+@click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.00, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
 
@@ -230,13 +245,14 @@ def main(**kwargs):
             sigma_max=opts.sigma_max,
             loss_type=opts.cd_loss,
             weight_mode=opts.cd_weight_mode,
+            sampling_mode=opts.sampling_mode,
+            terminal_anchor=opts.terminal_anchor,
+            terminal_teacher_hop=opts.terminal_teacher_hop,
+            sync_dropout=opts.sync_dropout,
         )
         # Provenance and optional eval knob (stored only).
         c.teacher = opts.teacher
         c.snap_cd_eval = opts.snap_cd_eval
-        # Target network mode for sigma_s denoiser (OpenAI CM style).
-        c.cd_target_mode = opts.cd_target_mode
-        c.cd_target_ema = opts.cd_target_ema
         # Note: do NOT auto-seed student weights from teacher by default to avoid
         # label embedding shape mismatches across checkpoints/datasets.
 
@@ -258,6 +274,9 @@ def main(**kwargs):
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)
     c.ema_halflife_kimg = int(opts.ema * 1000)
+    c.ema_rampup_ratio = opts.ema_rampup if opts.ema_rampup > 0 else None
+    c.phema_stds = parse_float_list(opts.phema)
+    c.phema_snapshot_ticks = opts.phema_snap
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)

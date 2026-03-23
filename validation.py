@@ -99,7 +99,6 @@ def run_fid_validation(
     ref: Optional[str] = None,
     ref_data: Optional[str] = None,
     dump_images_dir: Optional[str] = None,
-    overwrite: bool = False,
     step_kimg: Optional[int] = None,
     wandb_run: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -107,14 +106,6 @@ def run_fid_validation(
     device = torch.device('cuda')
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-
-    # Short-circuit if snapshot for this step exists and overwrite is False.
-    if (step_kimg is not None) and (rank == 0):
-        step_json = os.path.join(run_dir, f'val_{int(step_kimg):06d}.json')
-        if (not overwrite) and os.path.isfile(step_json):
-            dist.print0(f'[VAL] Skipping validation at kimg={step_kimg} (results exist).')
-            torch.distributed.barrier()
-            return {}
 
     # Ensure network is synchronized across ranks before validation.
     # Allow disabling this expensive check via EDM_DDP_CHECK=0.
@@ -164,7 +155,14 @@ def run_fid_validation(
         bsize = len(b_idxs)
         if bsize == 0:
             continue
-        torch.distributed.barrier()
+        # NOTE: Do NOT barrier every batch by default.
+        # A per-batch barrier makes validation run in strict lockstep across all ranks,
+        # which can dramatically slow things down and can amplify minor stragglers into
+        # NCCL collective timeouts on large multi-node jobs.
+        # If you ever need it for debugging, enable explicitly:
+        #   export EDM_VAL_BARRIER_EACH_BATCH=1
+        if os.environ.get('EDM_VAL_BARRIER_EACH_BATCH', '0') == '1':
+            torch.distributed.barrier()
         local_batch_idx += 1
         if rank == 0 and (local_batch_idx == 1 or (local_batch_idx % 10 == 0) or (local_batch_idx == non_empty_rank_batches)):
             pct = 100.0 * local_batch_idx / max(non_empty_rank_batches, 1)
@@ -242,21 +240,9 @@ def run_fid_validation(
             # Fallback without timestamp.
             with open(os.path.join(run_dir, 'metrics-val.jsonl'), 'at') as f:
                 f.write(json.dumps(result) + '\n')
-        # Snapshot full JSON.
-        if step_kimg is not None:
-            payload = dict(
-                fid=float(fid_value),
-                mu=mu.cpu().numpy().tolist(),
-                sigma=sigma.cpu().numpy().tolist(),
-                num_images=int(num_images),
-                step_kimg=int(step_kimg),
-                sampler=sampler or {},
-                labels=labels,
-                ref=ref,
-                ref_data=ref_data,
-            )
-            with open(os.path.join(run_dir, f'val_{int(step_kimg):06d}.json'), 'wt') as f:
-                json.dump(payload, f)
+        # NOTE: The per-step val_{kimg}.json files containing full Inception
+        # mu/sigma have been removed — they were ~33MB each and redundant with
+        # metrics-val.jsonl which already records the FID value.
         # W&B logging if available.
         if wandb_run is not None:
             try:
@@ -319,7 +305,6 @@ def maybe_validate(
         ref=validation_kwargs.get('ref', None),
         ref_data=validation_kwargs.get('ref_data', None),
         dump_images_dir=validation_kwargs.get('dump_images_dir', None),
-        overwrite=bool(validation_kwargs.get('overwrite', False)),
         step_kimg=int(step_kimg),
         wandb_run=wandb_run,
     )
