@@ -715,7 +715,23 @@ def training_loop(
             state_dict = dict(net=net, optimizer_state=optimizer.state_dict())
             if phema is not None:
                 state_dict['phema'] = phema.state_dict()
-            torch.save(state_dict, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            state_path = os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt')
+            _max_save_attempts = 3
+            for _attempt in range(1, _max_save_attempts + 1):
+                try:
+                    torch.save(state_dict, state_path)
+                    break
+                except Exception as _save_err:
+                    # Remove any partial file left behind by the failed write.
+                    try:
+                        os.remove(state_path)
+                    except OSError:
+                        pass
+                    if _attempt < _max_save_attempts:
+                        dist.print0(f'[STATE DUMP] Save attempt {_attempt}/{_max_save_attempts} failed ({_save_err}); retrying in 30s...')
+                        time.sleep(30)
+                    else:
+                        dist.print0(f'[STATE DUMP] All {_max_save_attempts} save attempts failed; skipping state dump at kimg={cur_nimg//1000}.')
             # Keep the 2 most recent state files plus the one corresponding to the
             # best validation FID seen so far. Delete everything else.
             best_fid_state = None
@@ -735,10 +751,10 @@ def training_loop(
             protected = set(all_states[-2:])
             if best_fid_state is not None:
                 protected.add(best_fid_state)
-            for state_path in all_states:
-                if state_path not in protected:
+            for _old_state_path in all_states:
+                if _old_state_path not in protected:
                     try:
-                        os.remove(state_path)
+                        os.remove(_old_state_path)
                     except OSError:
                         pass
             if os.environ.get('CD_DDP_DEBUG'):
