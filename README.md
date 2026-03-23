@@ -1,6 +1,8 @@
-# Multi-Step Consistency Distillation (EDM)
+# Multistep Consistency Distillation in the EDM Framework *(Unofficial)*
 
-Implementation of [Multi-Step Consistency Models](https://arxiv.org/abs/2403.06807) (Heek et al., 2024) translated from the original VP/DDIM formulation to the [EDM](https://arxiv.org/abs/2206.00364) framework (Karras et al., 2022).
+An open-source, unofficial implementation of [Multistep Consistency Models](https://arxiv.org/abs/2403.06807) (Heek et al., 2024) re-formulated in the [EDM](https://arxiv.org/abs/2206.00364) framework (Karras et al., 2022). The original paper uses a VP / DDIM formulation; this repo adapts it to EDM's Karras noise schedule and Heun 2nd-order teacher, and adds several training improvements documented below. (Repo forked from Nvidia's EDM repo)
+
+
 
 ## Results
 
