@@ -26,7 +26,7 @@ The 8-step student was trained for 210 Mimg on 32 GPUs (8 nodes × 4 H100s) usin
 - **Teacher step annealing** — smooth ramp of the number of teacher steps from `T_start` to `T_end` over a configurable number of kimg, giving the student time to warm up before facing harder targets
 - **Built-in FID validation** — periodic FID evaluation runs directly inside the training loop on a configurable schedule; no separate evaluation script needed
 - **W&B integration** — loss curves, FID, gradient norms, EMA diagnostics, CD edge statistics, and step-level metrics
-- **Mixed precision** — FP16 for student forward/backward; FP32 for numerically sensitive operations (invDDIM, Heun hops)
+- **Mixed precision** — FP16/FP32 (Mixed Precision) for student forward/backward; FP64 for numerically sensitive operations (invDDIM, Heun hops)
 - **Multi-node DDP** — standard PyTorch distributed with a barrier-guarded checkpoint save so no rank races ahead during I/O
 
 ## Prerequisites
