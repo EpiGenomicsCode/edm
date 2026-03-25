@@ -9,7 +9,7 @@ An open-source, unofficial implementation of [Multistep Consistency Models](http
 | Model | NFEs | FID (ImageNet-64, class-cond.) |
 |-------|------|-------------------------------|
 | Teacher (EDM, Heun) - Deterministic Sampler (No Churn)| 512 | 2.3 |
-| **Student (this, S=8)** | **8** | **2.7** |
+| **Student (this, S=8)** | **8** | **2.6** |
 
 The 8-step student was trained for 210 Mimg on 32 GPUs (8 nodes × 4 H100s) using the full configuration below.
 
