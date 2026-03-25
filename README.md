@@ -8,12 +8,12 @@ An open-source, unofficial implementation of [Multistep Consistency Models](http
 
 | Model | NFEs | FID (ImageNet-64, class-cond.) |
 |-------|------|-------------------------------|
-| Teacher (EDM, Heun) - Deterministic Sampler (No Churn)| 512 | 2.3 |
-| **Student (this, S=8)** | **8** | **2.6** |
+| Teacher (EDM, Heun) - Deterministic Sampler (No Churn)| 511 | 2.32 |
+| **Student (this, S=8)** | **8** | **2.61** |
 
-The 8-step student was trained for 210 Mimg on 32 GPUs (8 nodes × 4 H100s) using the full configuration below.
+The 8-step student was trained for 68 Mimg on 32 GPUs (8 nodes × 4 H100s) using the full configuration below.
 
-**[Download pretrained student checkpoint (phema-0206182-0.150.pkl)](https://drive.google.com/file/d/1GnYGrUnKCrKSdjA1YjI8JDLcGGxjjLU7/view?usp=share_link)**
+**[Download pretrained student checkpoint (phema-0067718-0.105.pkl)](https://drive.google.com/file/d/1HLJbsDeGwc7pA3aNLawASSDuPjbjOsh8/view?usp=share_link)**
 
 ## Features
 
