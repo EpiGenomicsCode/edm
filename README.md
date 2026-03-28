@@ -8,7 +8,7 @@ Running the EDM teacher at only 8 NFEs with the Heun sampler produces severe dis
 
 | Sampler | NFEs | FID (ImageNet-64, class-cond.) |
 |---------|------|-------------------------------|
-| Teacher (EDM Heun, deterministic, no churn) | 8 | ~25 *(discretization error)* |
+| Teacher (EDM Euler, deterministic, no churn) | 8 | ~25 *(discretization error)* |
 | Teacher (EDM Heun, deterministic, no churn) | 511 | 2.3 |
 | **Student — this repo (S=8, consistency distilled)** | **8** | **2.3** |
 
