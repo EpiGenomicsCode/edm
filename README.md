@@ -8,12 +8,12 @@ An open-source, unofficial implementation of [Multistep Consistency Models](http
 
 | Model | NFEs | FID (ImageNet-64, class-cond.) |
 |-------|------|-------------------------------|
-| Teacher (EDM, Heun) - Deterministic Sampler (No Churn)| 511 | 2.32 |
-| **Student (this, S=8)** | **8** | **2.61** |
+| Teacher (EDM, Heun) - Deterministic Sampler (No Churn)| 511 | 2.3 |
+| **Student (this, S=8)** | **8** | **2.3** |
 
-The 8-step student was trained for 68 Mimg on 32 GPUs (8 nodes × 4 H100s) using the full configuration below.
+The 8-step student was trained for 157 Mimg on 32 GPUs (8 nodes × 4 H100s) using the full configuration below.
 
-**[Download pretrained student checkpoint (phema-0067718-0.105.pkl)](https://drive.google.com/file/d/1HLJbsDeGwc7pA3aNLawASSDuPjbjOsh8/view?usp=share_link)**
+**[Download pretrained student checkpoint (network-snapshot-157698.pkl)](https://drive.google.com/file/d/1KCufldmXzjWPkyQvPiykxpadLTbqg99N/view?usp=share_link)**
 
 ## Features
 
@@ -76,7 +76,7 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --ema=50 --ema_rampup=0.05 --lr=8e-5 \
   --phema=0.05,0.10 --phema_snap=60 \
   --consistency=True \
-  --dropout=0.13 \
+  --dropout=0.20 \
   --teacher=edm-imagenet-64x64-cond-adm.pkl \
   --S=8 --T_start=64 --T_end=1280 --T_anneal_kimg=104800 \
   --rho=7 --sigma_min=0.002 --sigma_max=80 \
